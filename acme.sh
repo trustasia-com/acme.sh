@@ -1232,6 +1232,17 @@ _createkey() {
     _new_key_file="1"
   fi
 
+  case "$eccname" in
+  ed25519 | ml-dsa-44 | ml-dsa-65 | ml-dsa-87)
+    if ! ${ACME_OPENSSL_BIN:-openssl} genpkey -algorithm "$eccname" -out "$f"; then
+      _err "OpenSSL does not support $eccname (ML-DSA requires OpenSSL 3.5+)."
+      [ -z "$_new_key_file" ] || rm -f "$f"
+      return 1
+    fi
+    return 0
+    ;;
+  esac
+
   if _isEccKey "$length"; then
     _debug "Using EC name: $eccname"
     if _opkey="$(${ACME_OPENSSL_BIN:-openssl} ecparam -name "$eccname" -noout -genkey 2>/dev/null)"; then
@@ -3019,6 +3030,7 @@ _clearAPI() {
   ACME_NEW_NONCE=""
   ACME_AGREEMENT=""
   ACME_RENEWAL_INFO=""
+  ACME_POP_SUPPORTED=""
 }
 
 #server
@@ -3065,6 +3077,8 @@ _initAPI() {
 
     ACME_RENEWAL_INFO=$(echo "$response" | _egrep_o 'renewalInfo" *: *"[^"]*"' | cut -d '"' -f 3)
     export ACME_RENEWAL_INFO
+
+    ACME_POP_SUPPORTED="$(printf '%s' "$response" | _normalizeJson | _egrep_o '"popSupported" *: *true')"
 
     _debug "ACME_KEY_CHANGE" "$ACME_KEY_CHANGE"
     _debug "ACME_NEW_AUTHZ" "$ACME_NEW_AUTHZ"
@@ -4881,6 +4895,265 @@ _convertValidaty() {
   fi
 }
 
+# draft-ietf-acme-pop-00 signature mode. Binary values stay in private files.
+# DER SPKI -> supported algorithm name (never infer the proof from JWS settings).
+_pop_key_algorithm() {
+  _pop_objects="$(${ACME_OPENSSL_BIN:-openssl} asn1parse -inform DER -in "$1" 2>/dev/null | grep 'OBJECT *:' | sed 's/.*OBJECT *://')"
+  case "$_pop_objects" in
+  rsaEncryption)
+    _pop_bits="$(${ACME_OPENSSL_BIN:-openssl} pkey -pubin -inform DER -in "$1" -text_pub -noout 2>/dev/null | _head_n 1 | tr -cd '0-9')"
+    if [ -z "$_pop_bits" ] || [ "$_pop_bits" -lt 2048 ] || [ "$_pop_bits" -gt 8192 ]; then
+      return 1
+    fi
+    echo rsa
+    ;;
+  'id-ecPublicKey
+prime256v1') echo ec-256 ;;
+  'id-ecPublicKey
+secp384r1') echo ec-384 ;;
+  'id-ecPublicKey
+secp521r1') echo ec-521 ;;
+  ED25519 | ML-DSA-44 | ML-DSA-65 | ML-DSA-87) echo "$_pop_objects" ;;
+  *)
+    _err "Unsupported PoP key; use RSA, P-256/P-384/P-521, Ed25519 or ML-DSA."
+    return 1
+    ;;
+  esac
+}
+
+# Private PEM -> exact base64url DER SPKI.
+_pop_key_spki() (
+  umask 077
+  _pop_tmp="$(mktemp -d)" || exit 1
+  trap 'rm -rf "$_pop_tmp"' 0
+  ${ACME_OPENSSL_BIN:-openssl} pkey -in "$1" -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null || exit 1
+  _pop_key_algorithm "$_pop_tmp/key" >/dev/null || exit 1
+  _base64 "" <"$_pop_tmp/key" | _url_replace
+)
+
+# keyfile, canonical 32-byte base64url nonce, exact newOrder payload file.
+_pop_proof() (
+  umask 077
+  _pop_tmp="$(mktemp -d)" || exit 1
+  trap 'rm -rf "$_pop_tmp"' 0
+  case "$2" in
+  '' | *[!A-Za-z0-9_-]*) exit 1 ;;
+  esac
+  [ "${#2}" -eq 43 ] || exit 1
+  _durl_replace_base64 "$2" | _dbase64 >"$_pop_tmp/nonce" || exit 1
+  [ "$(wc -c <"$_pop_tmp/nonce" | tr -d ' ')" = 32 ] || exit 1
+  [ "$(_base64 "" <"$_pop_tmp/nonce" | _url_replace)" = "$2" ] || exit 1
+  ${ACME_OPENSSL_BIN:-openssl} pkey -in "$1" -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null || exit 1
+  _pop_alg="$(_pop_key_algorithm "$_pop_tmp/key")" || exit 1
+  ${ACME_OPENSSL_BIN:-openssl} dgst -sha256 -binary "$3" >"$_pop_tmp/hash" || exit 1
+  printf '%s' 'ACME-pop-01-sig v1:' >"$_pop_tmp/message"
+  cat "$_pop_tmp/nonce" "$_pop_tmp/hash" >>"$_pop_tmp/message" || exit 1
+  case "$_pop_alg" in
+  rsa)
+    ${ACME_OPENSSL_BIN:-openssl} dgst -sha256 -sign "$1" -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -out "$_pop_tmp/proof" "$_pop_tmp/message" || exit 1
+    ;;
+  ec-*)
+    case "$_pop_alg" in
+    ec-256)
+      _pop_digest=sha256
+      _pop_width=64
+      ;;
+    ec-384)
+      _pop_digest=sha384
+      _pop_width=96
+      ;;
+    ec-521)
+      _pop_digest=sha512
+      _pop_width=132
+      ;;
+    esac
+    ${ACME_OPENSSL_BIN:-openssl} dgst -"$_pop_digest" -sign "$1" -out "$_pop_tmp/signature" "$_pop_tmp/message" || exit 1
+    _pop_ints="$(${ACME_OPENSSL_BIN:-openssl} asn1parse -inform DER -in "$_pop_tmp/signature" | grep 'INTEGER *:' | sed 's/.*INTEGER *://')" || exit 1
+    [ "$(printf '%s\n' "$_pop_ints" | wc -l | tr -d ' ')" = 2 ] || exit 1
+    for _pop_int in $_pop_ints; do
+      case "$_pop_int" in '' | *[!A-Fa-f0-9]*) exit 1 ;; esac
+      [ "${#_pop_int}" -le "$_pop_width" ] || exit 1
+      while [ "${#_pop_int}" -lt "$_pop_width" ]; do _pop_int="0$_pop_int"; done
+      printf '%s' "$_pop_int" | _h2b >>"$_pop_tmp/proof" || exit 1
+    done
+    ;;
+  ED25519 | ML-DSA-*)
+    ${ACME_OPENSSL_BIN:-openssl} pkeyutl -sign -rawin -inkey "$1" -in "$_pop_tmp/message" -out "$_pop_tmp/proof" || exit 1
+    ;;
+  *) exit 1 ;;
+  esac
+  [ -s "$_pop_tmp/proof" ] || exit 1
+  _base64 "" <"$_pop_tmp/proof" | _url_replace
+)
+
+# These helpers deliberately avoid touching the account JWS algorithm/cache.
+_pop_field() {
+  _egrep_o '"'"$1"'":"[^"]*"' | cut -d '"' -f 4
+}
+
+_pop_check_keys() {
+  Le_PopKey="$(_pop_key_spki "$CERT_KEY_PATH")" || return 1
+  _pop_account_key="$(_pop_key_spki "$ACCOUNT_KEY_PATH")" || return 1
+  if [ "$Le_PopKey" = "$_pop_account_key" ]; then
+    _err "PoP requires different account and certificate keys."
+    return 1
+  fi
+}
+
+# Persist exactly what _send_signed_request base64url-encodes, including ARI retry.
+_pop_send_order() {
+  if [ "$Le_ACME_Pop" = 1 ]; then
+    (
+      umask 077
+      printf '%s' "$2" >"$DOMAIN_PATH/pop-new-order.json"
+    ) || return 1
+  fi
+  _send_signed_request "$1" "$2"
+}
+
+# draft §9.2.1: abandon this attempt and use a new, ordinary CSR order.
+_pop_fallback_issue() {
+  _info "PoP is unavailable or was rejected; falling back to a new CSR order."
+  Le_ACME_Pop=""
+  # Preserve the original Apache backup and run user pre-hooks only once.
+  _pop_skip_before_issue="$_pop_before_issue_done"
+  _pop_skip_renewal_check=1
+  Le_Vlist=""
+  Le_LinkOrder=""
+  Le_OrderFinalize=""
+  for _pop_conf in Le_ACME_Pop Le_Vlist Le_LinkOrder Le_OrderFinalize Le_PopOrder Le_PopKey Le_PopAccountKey; do
+    _cleardomainconf "$_pop_conf"
+  done
+  issue "$@"
+  _pop_fallback_result=$?
+  _pop_skip_before_issue=""
+  _pop_skip_renewal_check=""
+  return "$_pop_fallback_result"
+}
+
+# Return 2 for the draft's required inconsistent-response fallback, 1 for
+# a replaced key or malformed response that must not be accepted as PoP.
+_pop_save_order() {
+  _pop_echo_key="$(printf '%s' "$response" | _pop_field popKey)"
+  _pop_echo_ids="$(printf '%s' "$response" | _egrep_o '"identifiers":\[[^]]*\]')"
+  _pop_echo_marker="$(printf '%s' "$_pop_echo_ids" | _egrep_o '\{[^{}]*"type":"pop"[^{}]*\}')"
+  if [ "$code" = 201 ] && { [ -z "$_pop_echo_key" ] || [ -z "$_pop_echo_marker" ]; }; then return 2; fi
+  if [ "$code" != 201 ] || [ -z "$Le_LinkOrder" ] || [ "$_pop_echo_key" != "$Le_PopKey" ] ||
+    [ "$(printf '%s' "$_pop_echo_marker" | _pop_field type)" != pop ] ||
+    ! printf '%s' "$_pop_echo_marker" | grep '"value":""' >/dev/null; then
+    _err "The CA did not accept the exact PoP key and order."
+    return 1
+  fi
+  Le_PopOrder="$Le_LinkOrder"
+  Le_PopAccountKey="$_pop_account_key"
+  _savedomainconf Le_PopOrder "$Le_PopOrder"
+  _savedomainconf Le_PopKey "$Le_PopKey"
+  _savedomainconf Le_PopAccountKey "$Le_PopAccountKey"
+  _savedomainconf Le_LinkOrder "$Le_LinkOrder"
+}
+
+_pop_check_order_binding() {
+  _pop_saved_key="$(_readdomainconf Le_PopKey)"
+  _pop_saved_account="$(_readdomainconf Le_PopAccountKey)"
+  _pop_saved_order="$(_readdomainconf Le_PopOrder)"
+  if [ ! -s "$DOMAIN_PATH/pop-new-order.json" ] || [ -z "$_pop_saved_order" ] || [ "$Le_LinkOrder" != "$_pop_saved_order" ]; then
+    _err "Missing PoP order state; start a new order with --issue --acme-pop."
+    return 1
+  fi
+  _pop_check_keys || return 1
+  if [ "$Le_PopKey" != "$_pop_saved_key" ] || [ "$_pop_account_key" != "$_pop_saved_account" ]; then
+    _err "The certificate or account key changed; PoP requires a new order."
+    return 1
+  fi
+}
+
+# Called only for the separate pop authorization, never for DNS/IP authorization.
+_pop_complete_authorization() {
+  _pop_authz_url="$1"
+  _pop_authz="$response"
+  _pop_challenges="$(printf '%s' "$_pop_authz" | _egrep_o '"challenges":\[[^]]*\]')"
+  _pop_entry="$(printf '%s' "$_pop_challenges" | _egrep_o '\{[^{}]*"type":"pop-01"[^{}]*\}')"
+  if [ -z "$_pop_entry" ] || [ "$(printf '%s' "$_pop_challenges" | _pop_field type)" != pop-01 ] ||
+    [ "$(printf '%s' "$_pop_entry" | _pop_field key)" != "$Le_PopKey" ]; then
+    _err "Invalid PoP authorization or challenge key."
+    return 1
+  fi
+  case "$(printf '%s' "$_pop_authz" | _pop_field status | _head_n 1)" in
+  valid) return 0 ;;
+  pending) ;;
+  *)
+    _err "PoP authorization is not pending or valid."
+    return 1
+    ;;
+  esac
+  _pop_url="$(printf '%s' "$_pop_entry" | _pop_field url)"
+  _pop_nonce="$(printf '%s' "$_pop_entry" | _pop_field popNonce)"
+  if [ -z "$_pop_url" ] || [ -z "$_pop_nonce" ] || [ "$(printf '%s' "$_pop_entry" | _pop_field status)" != pending ] ||
+    printf '%s' "$_pop_entry" | grep '"challenge_ciphertext":' >/dev/null; then
+    _err "Unsupported or malformed PoP signature challenge."
+    return 1
+  fi
+  _pop_signature="$(_pop_proof "$CERT_KEY_PATH" "$_pop_nonce" "$DOMAIN_PATH/pop-new-order.json")" || return 1
+  if ! _send_signed_request "$_pop_url" "{\"proof\":\"$_pop_signature\"}" || [ "$code" != 200 ]; then
+    _pop_signature=""
+    _err "PoP proof submission failed."
+    return 1
+  fi
+  _pop_signature=""
+  _pop_attempt=0
+  while [ "$(printf '%s' "$response" | _pop_field status | _head_n 1)" != valid ]; do
+    case "$(printf '%s' "$response" | _pop_field status | _head_n 1)" in
+    pending | processing) ;;
+    *)
+      _err "PoP challenge failed."
+      return 1
+      ;;
+    esac
+    if [ "$_pop_attempt" -ge 30 ]; then
+      _err "Timed out waiting for PoP challenge."
+      return 1
+    fi
+    _sleep 2
+    if ! _send_signed_request "$_pop_url" || [ "$code" != 200 ]; then return 1; fi
+    _pop_attempt=$(_math "$_pop_attempt + 1")
+  done
+  _pop_attempt=0
+  while [ "$_pop_attempt" -lt 30 ]; do
+    if ! _send_signed_request "$_pop_authz_url" || [ "$code" != 200 ]; then return 1; fi
+    case "$(printf '%s' "$response" | _pop_field status | _head_n 1)" in
+    valid) return 0 ;;
+    pending | processing) _sleep 2 ;;
+    *)
+      _err "PoP validation failed."
+      return 1
+      ;;
+    esac
+    _pop_attempt=$(_math "$_pop_attempt + 1")
+  done
+  _err "Timed out waiting for PoP validation."
+  return 1
+}
+
+_pop_wait_ready() {
+  _pop_check_order_binding || return 1
+  _pop_attempt=0
+  while [ "$_pop_attempt" -lt 30 ]; do
+    if ! _send_signed_request "$Le_LinkOrder" || [ "$code" != 200 ]; then return 1; fi
+    if [ "$(printf '%s' "$response" | _pop_field popKey)" != "$Le_PopKey" ]; then return 1; fi
+    case "$(printf '%s' "$response" | _pop_field status | _head_n 1)" in
+    ready | valid) return 0 ;;
+    pending) _sleep 2 ;;
+    *)
+      _err "PoP order cannot be finalized."
+      return 1
+      ;;
+    esac
+    _pop_attempt=$(_math "$_pop_attempt + 1")
+  done
+  _err "Timed out waiting for all order authorizations."
+  return 1
+}
+
 MTC_ACCEPT_CONTENT_TYPE="application/pem-certificate-chain-with-properties"
 MTC_LANDMARK_WAIT_SECONDS=18000
 
@@ -4975,6 +5248,7 @@ _download_mtc_landmark() {
 
 #webroot, domain domainlist  keylength
 issue() {
+  _pop_before_issue_done=""
   if [ -z "$2" ]; then
     _usage "Usage: $PROJECT_ENTRY --issue --domain <domain.tld> --webroot <directory>"
     return 1
@@ -5028,7 +5302,7 @@ issue() {
   if [ -f "$DOMAIN_CONF" ]; then
     Le_NextRenewTime=$(_readdomainconf Le_NextRenewTime)
     _debug Le_NextRenewTime "$Le_NextRenewTime"
-    if [ -z "$FORCE" ] && [ -z "$_ari_should_renew" ] && [ "$Le_NextRenewTime" ] && [ "$(_time)" -lt "$Le_NextRenewTime" ]; then
+    if [ "$_pop_skip_renewal_check" != 1 ] && [ -z "$FORCE" ] && [ -z "$_ari_should_renew" ] && [ "$Le_NextRenewTime" ] && [ "$(_time)" -lt "$Le_NextRenewTime" ]; then
       _valid_to_saved=$(_readdomainconf Le_Valid_To)
       if [ "$_valid_to_saved" ] && ! _startswith "$_valid_to_saved" "+"; then
         _info "The domain is set to be valid to: $_valid_to_saved"
@@ -5057,9 +5331,25 @@ issue() {
     fi
   fi
 
+  _pop_skip_renewal_check=""
   _debug "Using ACME_DIRECTORY: $ACME_DIRECTORY"
   if ! _initAPI; then
     return 1
+  fi
+
+  if [ "$Le_ACME_Pop" = 1 ]; then
+    if [ -z "$ACME_POP_SUPPORTED" ]; then
+      _pop_fallback_issue "$@"
+      return $?
+
+    fi
+    if [ "$_extended_key_usage" ] || [ "$Le_OCSP_Staple" ]; then
+      _err "CSR extension requests cannot be combined with --acme-pop; select a certificate profile."
+      return 1
+    fi
+    _savedomainconf Le_ACME_Pop 1
+  else
+    _cleardomainconf Le_ACME_Pop
   fi
 
   _savedomainconf "Le_Domain" "$_main_domain"
@@ -5106,11 +5396,14 @@ issue() {
     _alt_domains=""
   fi
 
-  if ! _on_before_issue "$_web_roots" "$_main_domain" "$_alt_domains" "$_pre_hook" "$_local_addr"; then
+  if [ "$_pop_skip_before_issue" != 1 ] && ! _on_before_issue "$_web_roots" "$_main_domain" "$_alt_domains" "$_pre_hook" "$_local_addr"; then
     _err "_on_before_issue."
     _on_issue_err "$_post_hook"
     return 1
   fi
+
+  _pop_skip_before_issue=""
+  _pop_before_issue_done=1
 
   _saved_account_key_hash="$(_readcaconf "CA_KEY_HASH")"
   _debug2 _saved_account_key_hash "$_saved_account_key_hash"
@@ -5125,7 +5418,14 @@ issue() {
   fi
 
   export Le_Next_Domain_Key="$CERT_KEY_PATH.next"
-  if [ -f "$CSR_PATH" ] && [ ! -f "$CERT_KEY_PATH" ]; then
+  if [ "$Le_ACME_Pop" = 1 ] && [ "$Le_Vlist" ]; then
+    # Manual DNS retry must keep both keys and the original newOrder bytes.
+    if ! _pop_check_order_binding; then
+      _clearup
+      _on_issue_err "$_post_hook"
+      return 1
+    fi
+  elif [ -f "$CSR_PATH" ] && [ ! -f "$CERT_KEY_PATH" ] && [ "$Le_ACME_Pop" != 1 ]; then
     _info "Signing from existing CSR."
   else
     # When renewing from an old version, the empty Le_Keylength means 2048.
@@ -5169,7 +5469,7 @@ issue() {
         _keyusage="serverAuth"
       fi
     fi
-    if ! _createcsr "$_main_domain" "$_alt_domains" "$CERT_KEY_PATH" "$CSR_PATH" "$DOMAIN_SSL_CONF" "" "$_keyusage"; then
+    if [ "$Le_ACME_Pop" != 1 ] && ! _createcsr "$_main_domain" "$_alt_domains" "$CERT_KEY_PATH" "$CSR_PATH" "$DOMAIN_SSL_CONF" "" "$_keyusage"; then
       _err "Error creating CSR."
       _clearup
       _on_issue_err "$_post_hook"
@@ -5183,6 +5483,11 @@ issue() {
   fi
 
   _savedomainconf "Le_Keylength" "$_key_length"
+  if [ "$Le_ACME_Pop" = 1 ] && ! _pop_check_keys; then
+    _clearup
+    _on_issue_err "$_post_hook"
+    return 1
+  fi
 
   vlist="$Le_Vlist"
   _cleardomainconf "Le_Vlist"
@@ -5235,7 +5540,13 @@ issue() {
     fi
     _debug2 "_notAfter" "$_notAfter"
 
+    if [ "$Le_ACME_Pop" = 1 ]; then
+      _identifiers="$_identifiers,{\"type\":\"pop\",\"value\":\"\"}"
+    fi
     _newOrderObj="{\"identifiers\": [$_identifiers]"
+    if [ "$Le_ACME_Pop" = 1 ]; then
+      _newOrderObj="$_newOrderObj,\"popKey\":\"$Le_PopKey\""
+    fi
     if [ "$_notBefore" ]; then
       _newOrderObj="$_newOrderObj,\"notBefore\": \"$_notBefore\""
     fi
@@ -5265,7 +5576,7 @@ issue() {
     if [ "$_replaces_certID" ]; then
       _newOrderReplacesObj="$_newOrderObj,\"replaces\": \"$_replaces_certID\""
     fi
-    if ! _send_signed_request "$ACME_NEW_ORDER" "$_newOrderReplacesObj}"; then
+    if ! _pop_send_order "$ACME_NEW_ORDER" "$_newOrderReplacesObj}"; then
       _err "Error creating new order."
       _clearup
       _on_issue_err "$_post_hook"
@@ -5277,12 +5588,16 @@ issue() {
     # whenever the failure mentions ARI or the replaces field.
     if [ "$_replaces_certID" ] && { _contains "$response" "alreadyReplaced" || _contains "$response" "urn:ietf:params:acme:error:malformed" || _contains "$response" "'replaces'" || _contains "$response" "ARI"; }; then
       _info "ARI 'replaces' rejected by CA, retrying newOrder without 'replaces'."
-      if ! _send_signed_request "$ACME_NEW_ORDER" "$_newOrderObj}"; then
+      if ! _pop_send_order "$ACME_NEW_ORDER" "$_newOrderObj}"; then
         _err "Error creating new order."
         _clearup
         _on_issue_err "$_post_hook"
         return 1
       fi
+    fi
+    if [ "$Le_ACME_Pop" = 1 ] && _contains "$response" 'urn:ietf:params:acme:error:unsupportedIdentifier'; then
+      _pop_fallback_issue "$@"
+      return $?
     fi
     if _contains "$response" "invalid"; then
       if echo "$response" | _normalizeJson | grep '"status":"invalid"' >/dev/null 2>&1; then
@@ -5305,12 +5620,28 @@ issue() {
       return 1
     fi
 
+    if [ "$Le_ACME_Pop" = 1 ]; then
+      _pop_save_order
+      _pop_save_result=$?
+      if [ "$_pop_save_result" = 2 ]; then
+        _pop_fallback_issue "$@"
+        return $?
+      elif [ "$_pop_save_result" != 0 ]; then
+        _clearup
+        _on_issue_err "$_post_hook"
+        return 1
+      fi
+    fi
     #for dns manual mode
     _savedomainconf "Le_OrderFinalize" "$Le_OrderFinalize"
 
     _authorizations_seg="$(echo "$response" | _json_decode | _authorizations_from_order)"
     _debug2 _authorizations_seg "$_authorizations_seg"
     if [ -z "$_authorizations_seg" ]; then
+      if [ "$Le_ACME_Pop" = 1 ]; then
+        _pop_fallback_issue "$@"
+        return $?
+      fi
       _err "_authorizations_seg not found."
       _clearup
       _on_issue_err "$_post_hook"
@@ -5320,6 +5651,9 @@ issue() {
     _debug "STEP 2, Get the authorizations of each domain"
     #domain and authz map
     _authorizations_map=""
+    _pop_authz_count=0
+    _pop_saved_authz=""
+    _pop_saved_authz_url=""
     for _authz_url in $(echo "$_authorizations_seg" | tr ',' ' '); do
       _debug2 "_authz_url" "$_authz_url"
       if ! _send_signed_request "$_authz_url"; then
@@ -5342,6 +5676,20 @@ issue() {
         _on_issue_err "$_post_hook"
         return 1
       fi
+      _pop_identifier="$(printf '%s' "$response" | _egrep_o '"identifier":\{[^}]*\}')"
+      if [ "$(printf '%s' "$_pop_identifier" | _pop_field type)" = pop ]; then
+        _pop_authz_count=$(_math "$_pop_authz_count + 1")
+        if [ "$Le_ACME_Pop" != 1 ] ||
+          ! printf '%s' "$_pop_identifier" | grep '"value":""' >/dev/null; then
+          _err "Cannot complete the independent PoP authorization."
+          _clearup
+          _on_issue_err "$_post_hook"
+          return 1
+        fi
+        _pop_saved_authz="$response"
+        _pop_saved_authz_url="$_authz_url"
+        continue
+      fi
       _d="$(echo "$response" | _egrep_o '"value" *: *"[^"]*"' | cut -d : -f 2- | tr -d ' "')"
       if _contains "$response" "\"wildcard\" *: *true"; then
         _d="*.$_d"
@@ -5351,6 +5699,18 @@ issue() {
 $_authorizations_map"
     done
 
+    if [ "$Le_ACME_Pop" = 1 ]; then
+      if [ "$_pop_authz_count" != 1 ]; then
+        _pop_fallback_issue "$@"
+        return $?
+      fi
+      response="$_pop_saved_authz"
+      if ! _pop_complete_authorization "$_pop_saved_authz_url"; then
+        _clearup
+        _on_issue_err "$_post_hook"
+        return 1
+      fi
+    fi
     _debug2 _authorizations_map "$_authorizations_map"
 
     _index=0
@@ -5828,11 +6188,20 @@ $_authorizations_map"
 
   _clearup
   _info "Verification finished, beginning signing."
-  der="$(_getfile "${CSR_PATH}" "${BEGIN_CSR}" "${END_CSR}" | tr -d "\r\n" | _url_replace)"
+  if [ "$Le_ACME_Pop" = 1 ]; then
+    if ! _pop_wait_ready; then
+      _on_issue_err "$_post_hook"
+      return 1
+    fi
+    _finalize_payload='{}'
+  else
+    der="$(_getfile "${CSR_PATH}" "${BEGIN_CSR}" "${END_CSR}" | tr -d "\r\n" | _url_replace)"
+    _finalize_payload="{\"csr\": \"$der\"}"
+  fi
 
   _info "Let's finalize the order."
   _info "Le_OrderFinalize" "$Le_OrderFinalize"
-  if ! _send_signed_request "${Le_OrderFinalize}" "{\"csr\": \"$der\"}"; then
+  if ! _send_signed_request "${Le_OrderFinalize}" "$_finalize_payload"; then
     _err "Signing failed."
     _on_issue_err "$_post_hook"
     return 1
@@ -6364,6 +6733,7 @@ renew() {
   Le_Valid_From="$(_readdomainconf Le_Valid_From)"
   Le_Valid_To="$(_readdomainconf Le_Valid_To)"
   Le_ExtKeyUse="$(_readdomainconf Le_ExtKeyUse)"
+  Le_ACME_Pop="$(_readdomainconf Le_ACME_Pop)"
 
   # When renewing from an old version, the empty Le_Keylength means 2048.
   # Note, do not use DEFAULT_DOMAIN_KEY_LENGTH as that value may change over
@@ -6544,6 +6914,10 @@ ${_skipped_msg}
 
 #csr webroot
 signcsr() {
+  if [ "$Le_ACME_Pop" = 1 ]; then
+    _err "--signcsr cannot be combined with --acme-pop; use --issue."
+    return 1
+  fi
   _csrfile="$1"
   _csrW="$2"
   if [ -z "$_csrfile" ] || [ -z "$_csrW" ]; then
@@ -8109,6 +8483,9 @@ Parameters:
                                       If no match, the default offered chain will be used. (default: empty)
                                       See: $_PREFERRED_CHAIN_WIKI
 
+  --acme-pop                        Prefer draft-ietf-acme-pop-00; use CSR fallback when unsupported.
+                                   Also permits --keylength ed25519 or
+                                   ml-dsa-44/65/87 with a supporting OpenSSL (ML-DSA: 3.5+).
   --mtc-landmark                    Request MTC certificate responses and optionally download the
                                       landmark certificate as <domain>-landmark.cer. A pending or
                                       unavailable landmark does not fail standalone certificate issuance.
@@ -9114,6 +9491,9 @@ _process() {
     --eab-hmac-key)
       _eab_hmac_key="$2"
       shift
+      ;;
+    --acme-pop)
+      Le_ACME_Pop="1"
       ;;
     --mtc-landmark)
       Le_MTC_Landmark="1"
