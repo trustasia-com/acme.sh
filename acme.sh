@@ -1233,9 +1233,9 @@ _createkey() {
   fi
 
   case "$eccname" in
-  ed25519 | ml-dsa-44 | ml-dsa-65 | ml-dsa-87)
+  ed25519 | ml-dsa-44 | ml-dsa-65 | ml-dsa-87 | ml-kem-512 | ml-kem-768 | ml-kem-1024)
     if ! ${ACME_OPENSSL_BIN:-openssl} genpkey -algorithm "$eccname" -out "$f"; then
-      _err "OpenSSL does not support $eccname (ML-DSA requires OpenSSL 3.5+)."
+      _err "OpenSSL does not support $eccname (ML-DSA and ML-KEM require OpenSSL 3.5+)."
       [ -z "$_new_key_file" ] || rm -f "$f"
       return 1
     fi
@@ -4895,7 +4895,7 @@ _convertValidaty() {
   fi
 }
 
-# draft-ietf-acme-pop-00 signature mode. Binary values stay in private files.
+# draft-ietf-acme-pop-00. Binary values stay in private files.
 # DER SPKI -> supported algorithm name (never infer the proof from JWS settings).
 _pop_key_algorithm() {
   _pop_objects="$(${ACME_OPENSSL_BIN:-openssl} asn1parse -inform DER -in "$1" 2>/dev/null | grep 'OBJECT *:' | sed 's/.*OBJECT *://')"
@@ -4913,9 +4913,9 @@ prime256v1') echo ec-256 ;;
 secp384r1') echo ec-384 ;;
   'id-ecPublicKey
 secp521r1') echo ec-521 ;;
-  ED25519 | ML-DSA-44 | ML-DSA-65 | ML-DSA-87) echo "$_pop_objects" ;;
+  ED25519 | ML-DSA-44 | ML-DSA-65 | ML-DSA-87 | ML-KEM-512 | ML-KEM-768 | ML-KEM-1024) echo "$_pop_objects" ;;
   *)
-    _err "Unsupported PoP key; use RSA, P-256/P-384/P-521, Ed25519 or ML-DSA."
+    _err "Unsupported PoP key; use RSA, P-256/P-384/P-521, Ed25519, ML-DSA or ML-KEM."
     return 1
     ;;
   esac
@@ -4986,6 +4986,84 @@ _pop_proof() (
   _base64 "" <"$_pop_tmp/proof" | _url_replace
 )
 
+# keyfile, canonical base64url KEM ciphertext, exact newOrder payload file.
+_pop_kem_proof() (
+  umask 077
+  _pop_tmp="$(mktemp -d)" || exit 1
+  trap 'rm -rf "$_pop_tmp"' 0
+  trap 'exit 1' 1 2 15
+  ${ACME_OPENSSL_BIN:-openssl} pkey -in "$1" -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null || exit 1
+  case "$(_pop_key_algorithm "$_pop_tmp/key")" in
+  ML-KEM-512) _pop_ct_size=768 ;;
+  ML-KEM-768) _pop_ct_size=1088 ;;
+  ML-KEM-1024) _pop_ct_size=1568 ;;
+  *) exit 1 ;;
+  esac
+  case "$2" in
+  '' | *[!A-Za-z0-9_-]*) exit 1 ;;
+  esac
+  [ "${#2}" -eq "$(((_pop_ct_size * 8 + 5) / 6))" ] || exit 1
+  _durl_replace_base64 "$2" | _dbase64 >"$_pop_tmp/ciphertext" || exit 1
+  [ "$(wc -c <"$_pop_tmp/ciphertext" | tr -d ' ')" = "$_pop_ct_size" ] || exit 1
+  [ "$(_base64 "" <"$_pop_tmp/ciphertext" | _url_replace)" = "$2" ] || exit 1
+  ${ACME_OPENSSL_BIN:-openssl} pkeyutl -decap -inkey "$1" -in "$_pop_tmp/ciphertext" -out "$_pop_tmp/secret" || exit 1
+  [ "$(wc -c <"$_pop_tmp/secret" | tr -d ' ')" = 32 ] || exit 1
+  # RFC 5869: absent salt is HashLen zero bytes. Never log the derived keys.
+  _pop_secret_hex="$(_hex_dump <"$_pop_tmp/secret" | tr -d ' ')"
+  ${ACME_OPENSSL_BIN:-openssl} kdf -keylen 32 -kdfopt digest:SHA256 \
+    -kdfopt "hexkey:$_pop_secret_hex" \
+    -kdfopt hexsalt:0000000000000000000000000000000000000000000000000000000000000000 \
+    -kdfopt 'info:ACME-pop-01-KEM v1' -binary -out "$_pop_tmp/mac-key" HKDF || exit 1
+  _pop_secret_hex=""
+  [ "$(wc -c <"$_pop_tmp/mac-key" | tr -d ' ')" = 32 ] || exit 1
+  _pop_mac_hex="$(_hex_dump <"$_pop_tmp/mac-key" | tr -d ' ')"
+  ${ACME_OPENSSL_BIN:-openssl} dgst -sha256 -binary "$3" >"$_pop_tmp/hash" || exit 1
+  _hmac sha256 "$_pop_mac_hex" <"$_pop_tmp/hash" >"$_pop_tmp/proof" || exit 1
+  _pop_mac_hex=""
+  [ "$(wc -c <"$_pop_tmp/proof" | tr -d ' ')" = 32 ] || exit 1
+  _base64 "" <"$_pop_tmp/proof" | _url_replace
+)
+
+# Select the proof from the actual certificate key, not from server fields.
+_pop_challenge_proof() (
+  umask 077
+  _pop_tmp="$(mktemp -d)" || exit 1
+  trap 'rm -rf "$_pop_tmp"' 0
+  ${ACME_OPENSSL_BIN:-openssl} pkey -in "$1" -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null || exit 1
+  _pop_alg="$(_pop_key_algorithm "$_pop_tmp/key")" || exit 1
+  case "$_pop_alg" in
+  ML-KEM-*)
+    if printf '%s' "$2" | grep '"popNonce":' >/dev/null; then exit 1; fi
+    _pop_kem_proof "$1" "$(printf '%s' "$2" | _pop_field challenge_ciphertext)" "$3"
+    ;;
+  *)
+    if printf '%s' "$2" | grep '"challenge_ciphertext":' >/dev/null; then exit 1; fi
+    _pop_proof "$1" "$(printf '%s' "$2" | _pop_field popNonce)" "$3"
+    ;;
+  esac
+)
+
+# Detect KEM even when an existing key was supplied with a different keylength.
+_pop_is_kem_key() {
+  ${ACME_OPENSSL_BIN:-openssl} pkey -in "$1" -pubout -outform DER 2>/dev/null |
+    ${ACME_OPENSSL_BIN:-openssl} asn1parse -inform DER 2>/dev/null | grep 'OBJECT *:ML-KEM-' >/dev/null
+}
+
+# Exercise the required OpenSSL operations before user pre-hooks run.
+_pop_check_kem_support() (
+  umask 077
+  _pop_tmp="$(mktemp -d)" || exit 1
+  trap 'rm -rf "$_pop_tmp"' 0
+  trap 'exit 1' 1 2 15
+  ${ACME_OPENSSL_BIN:-openssl} genpkey -algorithm "$1" -out "$_pop_tmp/private" || exit 1
+  ${ACME_OPENSSL_BIN:-openssl} pkey -in "$_pop_tmp/private" -pubout -out "$_pop_tmp/public" || exit 1
+  ${ACME_OPENSSL_BIN:-openssl} pkeyutl -encap -pubin -inkey "$_pop_tmp/public" \
+    -out "$_pop_tmp/ciphertext" -secret "$_pop_tmp/secret" || exit 1
+  _pop_ciphertext="$(_base64 "" <"$_pop_tmp/ciphertext" | _url_replace)"
+  printf '%s' '{}' >"$_pop_tmp/order"
+  _pop_kem_proof "$_pop_tmp/private" "$_pop_ciphertext" "$_pop_tmp/order" >/dev/null
+)
+
 # These helpers deliberately avoid touching the account JWS algorithm/cache.
 _pop_field() {
   _egrep_o '"'"$1"'":"[^"]*"' | cut -d '"' -f 4
@@ -5013,6 +5091,27 @@ _pop_send_order() {
 
 # draft §9.2.1: abandon this attempt and use a new, ordinary CSR order.
 _pop_fallback_issue() {
+  _pop_kem_required=""
+  case "$4" in
+  ml-kem-512 | ml-kem-768 | ml-kem-1024) _pop_kem_required=1 ;;
+  esac
+  if [ -s "$CERT_KEY_PATH" ] && _pop_is_kem_key "$CERT_KEY_PATH"; then
+    # Before key creation, a forced algorithm change may replace the old KEM key.
+    # Match issue/createDomainKey's replacement conditions; never downgrade a reused key.
+    _pop_saved_keylength="$(_readdomainconf Le_Keylength)"
+    if [ "$_pop_before_issue_done" = 1 ] ||
+      { [ "$Le_ForceNewDomainKey" != 1 ] && { [ "$4" = "${_pop_saved_keylength:-2048}" ] || [ -z "$FORCE" ] || [ "$_ACME_IS_RENEW" ]; }; }; then
+      _pop_kem_required=1
+    fi
+  fi
+  if [ "$_pop_kem_required" = 1 ]; then
+    _err "ML-KEM requires an ACME server accepting PoP; CSR fallback is impossible."
+    if [ "$_pop_before_issue_done" = 1 ]; then
+      _clearup
+      _on_issue_err "$_post_hook"
+    fi
+    return 1
+  fi
   _info "PoP is unavailable or was rejected; falling back to a new CSR order."
   Le_ACME_Pop=""
   # Preserve the original Apache backup and run user pre-hooks only once.
@@ -5073,7 +5172,8 @@ _pop_complete_authorization() {
   _pop_authz="$response"
   _pop_challenges="$(printf '%s' "$_pop_authz" | _egrep_o '"challenges":\[[^]]*\]')"
   _pop_entry="$(printf '%s' "$_pop_challenges" | _egrep_o '\{[^{}]*"type":"pop-01"[^{}]*\}')"
-  if [ -z "$_pop_entry" ] || [ "$(printf '%s' "$_pop_challenges" | _pop_field type)" != pop-01 ] ||
+  if [ -z "$_pop_entry" ] || [ "$_pop_challenges" != "\"challenges\":[$_pop_entry]" ] ||
+    [ "$(printf '%s' "$_pop_challenges" | _pop_field type)" != pop-01 ] ||
     [ "$(printf '%s' "$_pop_entry" | _pop_field key)" != "$Le_PopKey" ]; then
     _err "Invalid PoP authorization or challenge key."
     return 1
@@ -5087,13 +5187,14 @@ _pop_complete_authorization() {
     ;;
   esac
   _pop_url="$(printf '%s' "$_pop_entry" | _pop_field url)"
-  _pop_nonce="$(printf '%s' "$_pop_entry" | _pop_field popNonce)"
-  if [ -z "$_pop_url" ] || [ -z "$_pop_nonce" ] || [ "$(printf '%s' "$_pop_entry" | _pop_field status)" != pending ] ||
-    printf '%s' "$_pop_entry" | grep '"challenge_ciphertext":' >/dev/null; then
-    _err "Unsupported or malformed PoP signature challenge."
+  if [ -z "$_pop_url" ] || [ "$(printf '%s' "$_pop_entry" | _pop_field status)" != pending ]; then
+    _err "Unsupported or malformed PoP challenge."
     return 1
   fi
-  _pop_signature="$(_pop_proof "$CERT_KEY_PATH" "$_pop_nonce" "$DOMAIN_PATH/pop-new-order.json")" || return 1
+  _pop_signature="$(_pop_challenge_proof "$CERT_KEY_PATH" "$_pop_entry" "$DOMAIN_PATH/pop-new-order.json")" || {
+    _err "Unable to generate PoP proof; check the challenge and OpenSSL capabilities."
+    return 1
+  }
   if ! _send_signed_request "$_pop_url" "{\"proof\":\"$_pop_signature\"}" || [ "$code" != 200 ]; then
     _pop_signature=""
     _err "PoP proof submission failed."
@@ -5332,6 +5433,18 @@ issue() {
   fi
 
   _pop_skip_renewal_check=""
+  case "$_key_length" in
+  ml-kem-512 | ml-kem-768 | ml-kem-1024)
+    if [ "$Le_ACME_Pop" != 1 ]; then
+      _err "ML-KEM certificate keys require --acme-pop."
+      return 1
+    fi
+    if ! _pop_check_kem_support "$_key_length" 2>/dev/null; then
+      _err "OpenSSL does not support the required KEM/PoP operations for $_key_length (OpenSSL 3.5+ required)."
+      return 1
+    fi
+    ;;
+  esac
   _debug "Using ACME_DIRECTORY: $ACME_DIRECTORY"
   if ! _initAPI; then
     return 1
@@ -8484,8 +8597,9 @@ Parameters:
                                       See: $_PREFERRED_CHAIN_WIKI
 
   --acme-pop                        Prefer draft-ietf-acme-pop-00; use CSR fallback when unsupported.
-                                   Also permits --keylength ed25519 or
-                                   ml-dsa-44/65/87 with a supporting OpenSSL (ML-DSA: 3.5+).
+                                   Also permits --keylength ed25519, ml-dsa-44/65/87 or
+                                   ml-kem-512/768/1024 (ML-DSA/ML-KEM: OpenSSL 3.5+).
+                                   ML-KEM requires PoP and cannot fall back to a CSR.
   --mtc-landmark                    Request MTC certificate responses and optionally download the
                                       landmark certificate as <domain>-landmark.cer. A pending or
                                       unavailable landmark does not fail standalone certificate issuance.

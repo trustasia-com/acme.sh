@@ -477,6 +477,41 @@ certificate, CA, and full-chain output paths. If the CA offers an
 if it remains unavailable, standalone certificate issuance still succeeds. The
 setting is saved for subsequent renewals.
 
+### Experimental CSR-less PoP and ML-KEM Certificates
+
+`--acme-pop` enables [draft-ietf-acme-pop-00](https://datatracker.ietf.org/doc/html/draft-ietf-acme-pop-00).
+The certificate public key is committed when creating the order. A separate
+`pop-01` authorization proves possession of its private key, and the order is
+finalized without a CSR. Domain validation still runs normally.
+
+For an ACME server supporting ML-KEM, use OpenSSL 3.5 or newer with ML-KEM enabled:
+
+```sh
+export Ali_Key="<your Alibaba Cloud access key ID>"
+export Ali_Secret="<your Alibaba Cloud access key secret>"
+acme.sh --issue --acme-pop --keylength ml-kem-768 \
+  --server https://acme.mtc-test.trustasia.com/acme/v2/directory \
+  --certificate-profile mtc-7d --dns dns_ali -d example.com
+```
+
+Supported KEM key lengths are `ml-kem-512`, `ml-kem-768`, and `ml-kem-1024`.
+They require `--acme-pop`; if the CA does not accept PoP, issuance stops because
+a KEM key cannot sign a CSR. Signature keys retain the existing CSR fallback.
+Composite KEM keys are not supported.
+
+The client decapsulates the challenge with OpenSSL, derives a MAC key using
+HKDF-SHA-256, and authenticates the exact new-order payload with HMAC-SHA-256.
+It rejects mismatched challenge modes and malformed ciphertext encodings or
+lengths. Temporary shared secrets and derived keys are removed after proof
+generation.
+
+PoP mode, key length, and certificate profile are saved for renewal. Like the
+other non-RSA key types in this branch, ML-KEM uses the `<domain>_ecc` directory
+and can be selected for renewal with `--renew -d example.com --ecc`. Use separate
+`--cert-home` directories when keeping multiple non-RSA certificates for the
+same domain. The account key remains a signing key, such as the default P-256.
+Add `--mtc-landmark` to request the optional MTC landmark representation as well.
+
 ---
 
 ### 1️⃣1️⃣ Issue Certificates of Different Key Types (ECC or RSA)
