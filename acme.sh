@@ -1042,6 +1042,24 @@ _enddate() {
   esac
 }
 
+#file
+_startdate() {
+  _cf="$1"
+  _res="$(${ACME_OPENSSL_BIN:-openssl} x509 -noout -startdate -in "$_cf")"
+  if [ "$?" != "0" ] || [ -z "$_res" ]; then
+    return 1
+  fi
+
+  case "$_res" in
+  notBefore=*)
+    echo "${_res#notBefore=}"
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
 #Usage: hashalg  [outputhex]
 #Output Base64-encoded digest
 _digest() {
@@ -1986,13 +2004,34 @@ _utc_date() {
   date -u "+%Y-%m-%d %H:%M:%S"
 }
 
+#Usage: _calc_renew_fallback_cap createtime endtime
+#Prints the local fallback cap one third of the certificate lifetime before
+#endtime. Seconds keep the precision for short-lived certs; a one-second
+#minimum offset guarantees that the cap stays before endtime.
+_calc_renew_fallback_cap() {
+  _crfc_create="$1"
+  _crfc_end="$2"
+  _crfc_lifetime=$(_math "$_crfc_end" - "$_crfc_create")
+  if [ "$_crfc_lifetime" -gt 0 ]; then
+    _crfc_offset=$(_math "$_crfc_lifetime" / 3)
+  else
+    _crfc_offset=1
+  fi
+  if [ "$_crfc_offset" -lt 1 ]; then
+    _crfc_offset=1
+  fi
+  _math "$_crfc_end" - "$_crfc_offset"
+}
+
 #Usage: _calc_next_renew_time createtime renewaldays [endtime]
 #Prints createtime + renewaldays*86400 - 86400, capped so it never passes
 #the certificate expiry: with short-lived certs (internal CAs, upcoming
 #CA/B SC-081 47-day maximum) a fixed RenewalDays would otherwise schedule
 #the renewal after notAfter and leave an expired cert in place.
-#The cap is one day before endtime, or one hour before for certs whose
-#lifetime is 24 hours or less, mirroring the --valid-to scheduling.
+#The local fallback cap is one third of the certificate lifetime before
+#endtime: renewal starts after two thirds of the lifetime have elapsed.
+#Using seconds keeps the precision for short-lived certs; a one-second
+#minimum offset guarantees that the cap stays before endtime.
 _calc_next_renew_time() {
   _cnrt_create="$1"
   _cnrt_days="$2"
@@ -2002,11 +2041,7 @@ _calc_next_renew_time() {
     printf "%s" "$_cnrt_next"
     return 0
   fi
-  if [ "$(_math "$_cnrt_end" - "$_cnrt_create")" -gt 86400 ]; then
-    _cnrt_cap=$(_math "$_cnrt_end" - 86400)
-  else
-    _cnrt_cap=$(_math "$_cnrt_end" - 3600)
-  fi
+  _cnrt_cap=$(_calc_renew_fallback_cap "$_cnrt_create" "$_cnrt_end")
   if [ "$_cnrt_next" -gt "$_cnrt_cap" ]; then
     _cnrt_next="$_cnrt_cap"
   fi
@@ -6363,7 +6398,15 @@ $_authorizations_map"
     if [ "$?" = "0" ] && [ "$_enddate_value" ]; then
       _endtime_for_cap=$(_ssldate2time "$_enddate_value")
     fi
-    Le_NextRenewTime=$(_calc_next_renew_time "$Le_CertCreateTime" "$Le_RenewalDays" "$_endtime_for_cap")
+    _renew_base_time="$Le_CertCreateTime"
+    _startdate_value=$(_startdate "$CERT_PATH")
+    if [ "$?" = "0" ] && [ "$_startdate_value" ]; then
+      _starttime_for_cap=$(_ssldate2time "$_startdate_value")
+      if [ "$_starttime_for_cap" ]; then
+        _renew_base_time="$_starttime_for_cap"
+      fi
+    fi
+    Le_NextRenewTime=$(_calc_next_renew_time "$_renew_base_time" "$Le_RenewalDays" "$_endtime_for_cap")
     Le_NextRenewTimeStr=$(_time2str "$Le_NextRenewTime")
   fi
 
@@ -6542,6 +6585,40 @@ renew() {
   _debug2 "initpath again."
   _initpath "$Le_Domain" "$_isEcc"
 
+  _ari_valid=""
+
+  # Repair a cached schedule that would otherwise skip until after the actual
+  # certificate expiry. Older versions could persist the default 30-day time
+  # even for a short-lived cert when ARI was unavailable. A fixed-date
+  # --valid-to is deliberately non-renewable and must not be changed here.
+  if [ -z "$FORCE" ] && [ -f "$CERT_PATH" ] && { [ -z "$Le_Valid_To" ] || _startswith "$Le_Valid_To" "+"; }; then
+    _renew_enddate="$(_enddate "$CERT_PATH")"
+    _renew_endtime="$(_ssldate2time "$_renew_enddate")"
+    if [ "$Le_NextRenewTime" ] && [ "$_renew_endtime" ] && [ "$Le_NextRenewTime" -ge "$_renew_endtime" ]; then
+      _info "$(__red "WARNING: cached next renewal time $Le_NextRenewTimeStr is not before the certificate expiry $_renew_enddate.")"
+      _renew_startdate="$(_startdate "$CERT_PATH")"
+      _renew_starttime="$(_ssldate2time "$_renew_startdate")"
+      _renew_days="${Le_RenewalDays:-$DEFAULT_RENEW}"
+      if [ "$Le_Valid_To" ] || [ "$_renew_days" -lt 0 ]; then
+        _renew_safe_time="$(_calc_validto_renew_time "$_renew_endtime" "$_renew_days" "$(_time)")"
+      elif [ "$_renew_starttime" ]; then
+        _renew_safe_time="$(_calc_next_renew_time "$_renew_starttime" "$_renew_days" "$_renew_endtime")"
+      else
+        _renew_safe_time="$(_calc_validto_renew_time "$_renew_endtime" "" "$(_time)")"
+      fi
+      if [ "$_renew_safe_time" ] && [ "$_renew_safe_time" -lt "$_renew_endtime" ]; then
+        Le_NextRenewTime="$_renew_safe_time"
+        Le_NextRenewTimeStr=$(_time2str "$Le_NextRenewTime")
+        _savedomainconf Le_NextRenewTime "$Le_NextRenewTime"
+        _savedomainconf Le_NextRenewTimeStr "$Le_NextRenewTimeStr"
+        _info "$(__red "Repaired cached renewal time from the certificate validity: $Le_NextRenewTimeStr")"
+      else
+        _info "$(__red "WARNING: could not calculate a safe renewal time before the certificate expiry; renewing now.")"
+        Le_NextRenewTime="$(_time)"
+      fi
+    fi
+  fi
+
   # ARI (RFC 9773): fetch the CA's suggestedWindow on every renewal check.
   # If the window has started, renew now even if Le_NextRenewTime is in the future.
   # Le_RenewalDays and Le_Valid_To are only in the domain conf when the user
@@ -6575,6 +6652,9 @@ renew() {
         _debug "_ari_end_t" "$_ari_end_t"
         _debug "_ari_explanation_url" "$_ari_explanation_url"
         _debug "Le_NextRenewTime" "$Le_NextRenewTime"
+        if [ "$_ari_start_t" ] && [ "$_ari_end_t" ] && [ "$_ari_end_t" -gt "$_ari_start_t" ]; then
+          _ari_valid="1"
+        fi
         # Update ARI if needed
         if [ "$_ari_start_t" ] && [ "$_ari_end_t" ] && [ "$Le_NextRenewTime" ] && [ "$_ari_end_t" -gt "$_ari_start_t" ] && ([ "$Le_NextRenewTime" -lt "$_ari_start_t" ] || [ "$Le_NextRenewTime" -gt "$_ari_end_t" ]); then
           _ari_next="$(_calc_ari_renew_time "$_ari_start_t" "$_ari_end_t" "$(_time)" "$Le_NextRenewTime" "$_ari_pinned")"
@@ -6597,6 +6677,29 @@ renew() {
             _info "For more information on this renewal: $(__green "$_ari_explanation_url")"
           fi
         fi
+      fi
+    fi
+  fi
+
+  # With no valid ARI window, also move a cache written by an older local
+  # fallback policy when it is later than the new one-third-of-lifetime cap.
+  # Valid ARI remains authoritative, and expiry-anchored --days/--valid-to
+  # schedules keep their own semantics. Long-lived certs whose original
+  # schedule is earlier than the cap are not changed.
+  _renew_days="${Le_RenewalDays:-$DEFAULT_RENEW}"
+  if [ -z "$FORCE" ] && [ -z "$_ari_valid" ] && [ -z "$Le_Valid_To" ] && [ "$_renew_days" -ge 0 ] && [ "$Le_NextRenewTime" ] && [ -f "$CERT_PATH" ]; then
+    _renew_enddate="$(_enddate "$CERT_PATH")"
+    _renew_endtime="$(_ssldate2time "$_renew_enddate")"
+    _renew_startdate="$(_startdate "$CERT_PATH")"
+    _renew_starttime="$(_ssldate2time "$_renew_startdate")"
+    if [ "$_renew_starttime" ] && [ "$_renew_endtime" ]; then
+      _renew_fallback_cap=$(_calc_renew_fallback_cap "$_renew_starttime" "$_renew_endtime")
+      if [ "$Le_NextRenewTime" -gt "$_renew_fallback_cap" ]; then
+        Le_NextRenewTime=$(_calc_next_renew_time "$_renew_starttime" "$_renew_days" "$_renew_endtime")
+        Le_NextRenewTimeStr=$(_time2str "$Le_NextRenewTime")
+        _savedomainconf Le_NextRenewTime "$Le_NextRenewTime"
+        _savedomainconf Le_NextRenewTimeStr "$Le_NextRenewTimeStr"
+        _info "No valid ARI window; using local certificate lifetime fallback: $(__green "$Le_NextRenewTimeStr")"
       fi
     fi
   fi
