@@ -4895,7 +4895,7 @@ _convertValidaty() {
   fi
 }
 
-# draft-ietf-acme-pop-00. Binary values stay in private files.
+# draft-ietf-acme-pop-01. Binary values stay in private files.
 # DER SPKI -> supported algorithm name (never infer the proof from JWS settings).
 _pop_key_algorithm() {
   _pop_objects="$(${ACME_OPENSSL_BIN:-openssl} asn1parse -inform DER -in "$1" 2>/dev/null | grep 'OBJECT *:' | sed 's/.*OBJECT *://')"
@@ -4977,8 +4977,12 @@ _pop_proof() (
       printf '%s' "$_pop_int" | _h2b >>"$_pop_tmp/proof" || exit 1
     done
     ;;
-  ED25519 | ML-DSA-*)
+  ED25519)
     ${ACME_OPENSSL_BIN:-openssl} pkeyutl -sign -rawin -inkey "$1" -in "$_pop_tmp/message" -out "$_pop_tmp/proof" || exit 1
+    ;;
+  ML-DSA-*)
+    # draft-01 section 5.1 requires the empty ML-DSA context string.
+    ${ACME_OPENSSL_BIN:-openssl} pkeyutl -sign -rawin -pkeyopt context-string: -inkey "$1" -in "$_pop_tmp/message" -out "$_pop_tmp/proof" || exit 1
     ;;
   *) exit 1 ;;
   esac
@@ -5067,6 +5071,65 @@ _pop_check_kem_support() (
 # These helpers deliberately avoid touching the account JWS algorithm/cache.
 _pop_field() {
   _egrep_o '"'"$1"'":"[^"]*"' | cut -d '"' -f 4
+}
+
+# Compact response JSON without changing strings. "top" hides nested values
+# so a challenge/extension status cannot be mistaken for the resource status.
+_pop_json() {
+  LC_ALL=C awk -v top="$1" '
+    {
+      for (i = 1; i <= length($0); i++) {
+        c = substr($0, i, 1)
+        if (quoted) {
+          if (!top || depth == 1) out = out c
+          if (escaped) escaped = 0
+          else if (c == "\\") escaped = 1
+          else if (c == "\"") quoted = 0
+          continue
+        }
+        if (c ~ /[ \t\r\n]/) continue
+        if (c == "}" || c == "]") depth--
+        if (depth < 0) { bad = 1; exit }
+        if (!top || depth <= 1) out = out c
+        if (c == "{") depth++
+        else if (c == "[") depth++
+        else if (c == "\"") quoted = 1
+      }
+    }
+    END {
+      if (bad || quoted || depth) exit 1
+      print out
+    }'
+}
+
+_pop_status() {
+  _pop_json top | _pop_field status
+}
+
+# Keep the existing attempt limit, but respect the CA delay between PoP polls.
+_pop_retry_wait() {
+  _pop_delay="$(printf '%s\n' "$responseHeaders" | grep -i '^Retry-After[ 	]*:' | _head_n 1 | cut -d : -f 2- | tr -d '\r' | sed 's/^[ 	]*//;s/[ 	]*$//')"
+  case "$_pop_delay" in
+  '') _pop_delay=2 ;;
+  *[!0-9]*)
+    # Convert the standard HTTP-date form using the existing portable date helper.
+    _pop_retry_date="$(printf '%s\n' "$_pop_delay" | LC_ALL=C awk '
+      NF == 6 && $1 ~ /^[A-Za-z][A-Za-z][A-Za-z],$/ && $2 ~ /^[0-9][0-9]$/ && $4 ~ /^[0-9][0-9][0-9][0-9]$/ && $5 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ && $6 == "GMT" {
+        split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", months, " ")
+        for (m = 1; m <= 12; m++) if ($3 == months[m]) printf "%s-%02d-%sT%sZ", $4, m, $2, $5
+      }')"
+    if [ -n "$_pop_retry_date" ] && _pop_retry_at="$(_date2time "$_pop_retry_date" 2>/dev/null)"; then
+      _pop_delay="$(_math "$_pop_retry_at - $(_time)")"
+      [ "$_pop_delay" -ge 0 ] || _pop_delay=0
+    else
+      _pop_delay=2
+    fi
+    ;;
+  esac
+  _pop_delay="$(printf '%s' "$_pop_delay" | sed 's/^0*//')"
+  _pop_delay="${_pop_delay:-0}"
+  _info "Retrying PoP validation in $_pop_delay seconds." >&2
+  _sleep "$_pop_delay"
 }
 
 _pop_check_keys() {
@@ -5169,7 +5232,7 @@ _pop_check_order_binding() {
 # Called only for the separate pop authorization, never for DNS/IP authorization.
 _pop_complete_authorization() {
   _pop_authz_url="$1"
-  _pop_authz="$response"
+  _pop_authz="$(printf '%s' "$response" | _pop_json)" || return 1
   _pop_challenges="$(printf '%s' "$_pop_authz" | _egrep_o '"challenges":\[[^]]*\]')"
   _pop_entry="$(printf '%s' "$_pop_challenges" | _egrep_o '\{[^{}]*"type":"pop-01"[^{}]*\}')"
   if [ -z "$_pop_entry" ] || [ "$_pop_challenges" != "\"challenges\":[$_pop_entry]" ] ||
@@ -5178,7 +5241,7 @@ _pop_complete_authorization() {
     _err "Invalid PoP authorization or challenge key."
     return 1
   fi
-  case "$(printf '%s' "$_pop_authz" | _pop_field status | _head_n 1)" in
+  case "$(printf '%s' "$_pop_authz" | _pop_status)" in
   valid) return 0 ;;
   pending) ;;
   *)
@@ -5202,8 +5265,8 @@ _pop_complete_authorization() {
   fi
   _pop_signature=""
   _pop_attempt=0
-  while [ "$(printf '%s' "$response" | _pop_field status | _head_n 1)" != valid ]; do
-    case "$(printf '%s' "$response" | _pop_field status | _head_n 1)" in
+  while [ "$(printf '%s' "$response" | _pop_status)" != valid ]; do
+    case "$(printf '%s' "$response" | _pop_status)" in
     pending | processing) ;;
     *)
       _err "PoP challenge failed."
@@ -5214,16 +5277,16 @@ _pop_complete_authorization() {
       _err "Timed out waiting for PoP challenge."
       return 1
     fi
-    _sleep 2
+    _pop_retry_wait || return 1
     if ! _send_signed_request "$_pop_url" || [ "$code" != 200 ]; then return 1; fi
     _pop_attempt=$(_math "$_pop_attempt + 1")
   done
   _pop_attempt=0
   while [ "$_pop_attempt" -lt 30 ]; do
     if ! _send_signed_request "$_pop_authz_url" || [ "$code" != 200 ]; then return 1; fi
-    case "$(printf '%s' "$response" | _pop_field status | _head_n 1)" in
+    case "$(printf '%s' "$response" | _pop_status)" in
     valid) return 0 ;;
-    pending | processing) _sleep 2 ;;
+    pending | processing) _pop_retry_wait || return 1 ;;
     *)
       _err "PoP validation failed."
       return 1
@@ -5241,9 +5304,9 @@ _pop_wait_ready() {
   while [ "$_pop_attempt" -lt 30 ]; do
     if ! _send_signed_request "$Le_LinkOrder" || [ "$code" != 200 ]; then return 1; fi
     if [ "$(printf '%s' "$response" | _pop_field popKey)" != "$Le_PopKey" ]; then return 1; fi
-    case "$(printf '%s' "$response" | _pop_field status | _head_n 1)" in
+    case "$(printf '%s' "$response" | _pop_status)" in
     ready | valid) return 0 ;;
-    pending) _sleep 2 ;;
+    pending) _pop_retry_wait || return 1 ;;
     *)
       _err "PoP order cannot be finalized."
       return 1
@@ -8596,7 +8659,7 @@ Parameters:
                                       If no match, the default offered chain will be used. (default: empty)
                                       See: $_PREFERRED_CHAIN_WIKI
 
-  --acme-pop                        Prefer draft-ietf-acme-pop-00; use CSR fallback when unsupported.
+  --acme-pop                        Prefer draft-ietf-acme-pop-01; use CSR fallback when unsupported.
                                    Also permits --keylength ed25519, ml-dsa-44/65/87 or
                                    ml-kem-512/768/1024 (ML-DSA/ML-KEM: OpenSSL 3.5+).
                                    ML-KEM requires PoP and cannot fall back to a CSR.

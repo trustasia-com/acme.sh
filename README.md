@@ -479,10 +479,14 @@ setting is saved for subsequent renewals.
 
 ### Experimental CSR-less PoP and ML-KEM Certificates
 
-`--acme-pop` enables [draft-ietf-acme-pop-00](https://datatracker.ietf.org/doc/html/draft-ietf-acme-pop-00).
+`--acme-pop` enables [draft-ietf-acme-pop-01](https://datatracker.ietf.org/doc/html/draft-ietf-acme-pop-01).
 The certificate public key is committed when creating the order. A separate
 `pop-01` authorization proves possession of its private key, and the order is
 finalized without a CSR. Domain validation still runs normally.
+
+The challenge type remains `pop-01`. ML-DSA proofs use an empty context string
+as required by draft-01. STAR orders are not implemented; ordinary client-driven
+renewal is unaffected by the new `popStarSupported` discovery field.
 
 For an ACME server supporting ML-KEM, use OpenSSL 3.5 or newer with ML-KEM enabled:
 
