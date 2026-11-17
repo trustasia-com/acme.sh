@@ -103,6 +103,57 @@ class PopTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "external-proof")
         self.assertEqual((domain / "pop-challenge.json").read_text(), challenge)
 
+    def test_pop_provider_receives_base64url_operations(self):
+        key, ciphertext, _ = self.kem_fixture("ML-KEM-768")
+        sig_key = self.work / "signature-key.pem"
+        sig_public_der = self.work / "signature-public.der"
+        self.openssl("genpkey", "-algorithm", "ED25519", "-out", sig_key)
+        self.openssl("pkey", "-in", sig_key, "-pubout", "-outform", "DER", "-out", sig_public_der)
+        public_der = self.work / "public.der"
+        self.openssl("pkey", "-in", key, "-pubout", "-outform", "DER", "-out", public_der)
+        provider = self.work / "pop_test.sh"
+        provider.write_text(r'''
+pop_test_get_public_key() {
+    openssl pkey -in "$TEST_KEY" -pubout -outform DER | _base64 "" | _url_replace
+}
+pop_test_sign() {
+    _durl_replace_base64 "$3" | _dbase64 >"$TEST_TMP/message"
+    openssl pkeyutl -sign -rawin -inkey "$TEST_KEY" -in "$TEST_TMP/message" |
+        _base64 "" | _url_replace
+}
+pop_test_decap() {
+    _durl_replace_base64 "$3" | _dbase64 >"$TEST_TMP/ciphertext"
+    openssl pkeyutl -decap -inkey "$TEST_KEY" -in "$TEST_TMP/ciphertext" -secret "$TEST_TMP/secret"
+    _base64 "" <"$TEST_TMP/secret" | _url_replace
+}
+''')
+        nonce = b64url(bytes(range(32)))
+        expected_sig = self.shell('_pop_proof "$1" "$2" "$3"', sig_key, nonce, self.order).stdout.strip()
+        script = r'''
+TEST_KEY="$1"; TEST_TMP="$2"; TEST_PROVIDER="$3"; TEST_PUBLIC="$4"
+export TEST_KEY TEST_TMP
+DOMAIN_PATH="$2"; _pop_provider=pop_test; _pop_key_id=test-key
+_pop_public_key_der_path="$TEST_PUBLIC"
+_findHook() { printf '%s' "$TEST_PROVIDER"; }
+_pop_provider_proof pop_test "$5" "$6"
+'''
+        public_check = self.shell(
+            'TEST_KEY="$1"; TEST_PROVIDER="$2"; _pop_provider=pop_test; _pop_key_id=test-key; '
+            '_findHook() { printf "%s" "$TEST_PROVIDER"; }; '
+            '_pop_provider_get_public_key_der >"$3" && _pop_key_length "$3"',
+            sig_key, provider, self.work / "provider-public.der",
+        )
+        self.assertEqual(public_check.stdout.strip(), "ed25519")
+        actual_sig = self.shell(script, sig_key, self.work, provider, sig_public_der, nonce, self.order).stdout.strip()
+        self.assertEqual(actual_sig, expected_sig)
+
+        expected_kem = self.shell('_pop_kem_proof "$1" "$2" "$3"', key, b64url(ciphertext), self.order).stdout.strip()
+        actual_kem = self.shell(
+            script.replace('_pop_provider_proof pop_test "$5" "$6"', '_pop_provider_kem_proof pop_test "$5" "$6"'),
+            key, self.work, provider, public_der, b64url(ciphertext), self.order,
+        ).stdout.strip()
+        self.assertEqual(actual_kem, expected_kem)
+
     def test_kem_proof_matches_independent_server(self):
         for bits in (512, 768, 1024):
             with self.subTest(bits=bits):
