@@ -60,6 +60,49 @@ class PopTests(unittest.TestCase):
                 self.assertEqual(result.stdout.strip(), b64url(expected))
                 self.assertEqual(key.stat().st_mode & 0o777, 0o600)
 
+    def test_public_key_input_uses_canonical_spki(self):
+        key = self.work / "key.pem"
+        public = self.work / "public.pem"
+        self.openssl("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", key)
+        self.openssl("pkey", "-in", key, "-pubout", "-out", public)
+        result = self.shell('_pop_public_key_spki "$1"', public)
+        expected = self.openssl("pkey", "-in", key, "-pubout", "-outform", "DER")
+        self.assertEqual(result.stdout.strip(), b64url(expected))
+
+    def test_csr_input_extracts_public_key_and_algorithm(self):
+        key = self.work / "key.pem"
+        csr = self.work / "request.csr"
+        public = self.work / "public.der"
+        self.openssl("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", key)
+        self.openssl("req", "-new", "-key", key, "-subj", "/CN=example.com", "-addext", "subjectAltName=DNS:example.com", "-out", csr)
+        result = self.shell('_pop_csr="${1}"; _pop_write_public_key csr "$2" && _pop_key_length "$2"', csr, public)
+        self.assertEqual(result.stdout.strip(), "ec-256")
+        expected = self.openssl("pkey", "-in", key, "-pubout", "-outform", "DER")
+        self.assertEqual(b64url(public.read_bytes()), b64url(expected))
+
+    def test_csr_input_uses_csr_domains(self):
+        key = self.work / "key.pem"
+        csr = self.work / "request.csr"
+        self.openssl("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", key)
+        self.openssl("req", "-new", "-key", key, "-subj", "/CN=example.com", "-addext", "subjectAltName=DNS:example.com,DNS:www.example.com", "-out", csr)
+        result = self.shell(
+            '_csr="$1"; _main_domain=wrong.example; _alt_domains=wrong.example; Le_ACME_Pop=1; _pop_private_key="$2"; _pop_prepare_inputs; printf "%s|%s" "$_main_domain" "$_alt_domains"',
+            csr, key,
+        )
+        self.assertEqual(result.stdout.strip(), "example.com|www.example.com")
+
+    def test_external_proof_command_receives_challenge_files(self):
+        domain = self.work / "domain"
+        domain.mkdir()
+        challenge = '{"type":"pop-01","popNonce":"nonce"}'
+        command = 'test -s "$ACME_POP_CHALLENGE_FILE" && test -s "$ACME_POP_ORDER_FILE" && printf external-proof'
+        result = self.shell(
+            'DOMAIN_PATH="$1"; Le_PopProofCommand="$2"; _pop_challenge_proof "" "$3" "$4"',
+            domain, command, challenge, self.order,
+        )
+        self.assertEqual(result.stdout.strip(), "external-proof")
+        self.assertEqual((domain / "pop-challenge.json").read_text(), challenge)
+
     def test_kem_proof_matches_independent_server(self):
         for bits in (512, 768, 1024):
             with self.subTest(bits=bits):

@@ -4921,7 +4921,7 @@ secp521r1') echo ec-521 ;;
   esac
 }
 
-# Private PEM -> exact base64url DER SPKI.
+# Private PEM/provider URI -> exact base64url DER SPKI.
 _pop_key_spki() (
   umask 077
   _pop_tmp="$(mktemp -d)" || exit 1
@@ -4929,6 +4929,65 @@ _pop_key_spki() (
   ${ACME_OPENSSL_BIN:-openssl} pkey -in "$1" -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null || exit 1
   _pop_key_algorithm "$_pop_tmp/key" >/dev/null || exit 1
   _base64 "" <"$_pop_tmp/key" | _url_replace
+)
+
+# Public PEM/DER -> exact base64url DER SPKI.
+_pop_public_key_spki() (
+  umask 077
+  _pop_tmp="$(mktemp -d)" || exit 1
+  trap 'rm -rf "$_pop_tmp"' 0
+  if ! ${ACME_OPENSSL_BIN:-openssl} pkey -pubin -in "$1" -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null; then
+    ${ACME_OPENSSL_BIN:-openssl} pkey -pubin -inform DER -in "$1" -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null || exit 1
+  fi
+  _pop_key_algorithm "$_pop_tmp/key" >/dev/null || exit 1
+  _base64 "" <"$_pop_tmp/key" | _url_replace
+)
+
+# CSR public key -> exact base64url DER SPKI.
+_pop_csr_key_spki() (
+  umask 077
+  _pop_tmp="$(mktemp -d)" || exit 1
+  trap 'rm -rf "$_pop_tmp"' 0
+  ${ACME_OPENSSL_BIN:-openssl} req -in "$1" -pubkey -noout -config /dev/null 2>/dev/null |
+    ${ACME_OPENSSL_BIN:-openssl} pkey -pubin -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null || exit 1
+  _pop_key_algorithm "$_pop_tmp/key" >/dev/null || exit 1
+  _base64 "" <"$_pop_tmp/key" | _url_replace
+)
+
+_pop_write_public_key() (
+  _pop_input="$1"
+  _pop_output="$2"
+  _pop_tmp="$(mktemp -d)" || return 1
+  trap 'rm -rf "$_pop_tmp"' 0
+  if [ "$_pop_input" = csr ]; then
+    ${ACME_OPENSSL_BIN:-openssl} req -in "$_pop_csr" -pubkey -noout -config /dev/null 2>/dev/null |
+      ${ACME_OPENSSL_BIN:-openssl} pkey -pubin -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null || return 1
+  elif [ "$_pop_input" = private ]; then
+    ${ACME_OPENSSL_BIN:-openssl} pkey -in "$_pop_private_key" -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null || return 1
+  else
+    if ! ${ACME_OPENSSL_BIN:-openssl} pkey -pubin -in "$_pop_input" -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null; then
+      ${ACME_OPENSSL_BIN:-openssl} pkey -pubin -inform DER -in "$_pop_input" -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null || return 1
+    fi
+  fi
+  _pop_key_algorithm "$_pop_tmp/key" >/dev/null || return 1
+  cp "$_pop_tmp/key" "$_pop_output"
+)
+
+_pop_der_spki() (
+  _pop_key_algorithm "$1" >/dev/null || exit 1
+  _base64 "" <"$1" | _url_replace
+)
+
+# Return the acme.sh key-length/path selector for a PoP SPKI.
+_pop_key_length() (
+  _pop_alg="$(_pop_key_algorithm "$1")" || exit 1
+  case "$_pop_alg" in
+  rsa) ${ACME_OPENSSL_BIN:-openssl} pkey -pubin -inform DER -in "$1" -text_pub -noout 2>/dev/null |
+    _head_n 1 | tr -cd '0-9' ;;
+  ec-*) echo "$_pop_alg" ;;
+  ED25519 | ML-DSA-* | ML-KEM-*) echo "$_pop_alg" | _lower_case ;;
+  *) exit 1 ;;
+  esac
 )
 
 # keyfile, canonical 32-byte base64url nonce, exact newOrder payload file.
@@ -5028,11 +5087,46 @@ _pop_kem_proof() (
   _base64 "" <"$_pop_tmp/proof" | _url_replace
 )
 
-# Select the proof from the actual certificate key, not from server fields.
+# Select the proof from the configured PoP proof source, not from server fields.
 _pop_challenge_proof() (
   umask 077
   _pop_tmp="$(mktemp -d)" || exit 1
   trap 'rm -rf "$_pop_tmp"' 0
+  _pop_challenge_file="$_pop_tmp/challenge"
+  printf '%s' "$2" >"$_pop_challenge_file" || exit 1
+  if [ "$DOMAIN_PATH" ]; then
+    printf '%s' "$2" >"$DOMAIN_PATH/pop-challenge.json" || exit 1
+  fi
+  if [ "$Le_PopProofCommand" ]; then
+    ACME_POP_CHALLENGE_FILE="$_pop_challenge_file"
+    ACME_POP_ORDER_FILE="$3"
+    ACME_POP_PUBLIC_KEY_FILE="$DOMAIN_PATH/pop-public-key.der"
+    export ACME_POP_CHALLENGE_FILE ACME_POP_ORDER_FILE ACME_POP_PUBLIC_KEY_FILE
+    _pop_external_output="$_pop_tmp/proof"
+    if ! eval "$Le_PopProofCommand" >"$_pop_external_output"; then exit 1; fi
+    _pop_external_proof="$(tr -d '\r\n' <"$_pop_external_output")"
+    case "$_pop_external_proof" in
+    '' | *[!A-Za-z0-9_-]*) exit 1 ;;
+    esac
+    printf '%s' "$_pop_external_proof"
+    exit 0
+  fi
+  if [ "$Le_PopManual" = 1 ]; then
+    if [ -z "$__INTERACTIVE" ]; then
+      _err "PoP manual mode requires an interactive terminal." >&2
+      exit 1
+    fi
+    _info "PoP challenge saved to: $DOMAIN_PATH/pop-challenge.json" >&2
+    _info "Use the configured key device to create the base64url proof." >&2
+    printf "Enter PoP proof: " >&2
+    IFS= read -r _pop_manual_proof || exit 1
+    case "$_pop_manual_proof" in
+    '' | *[!A-Za-z0-9_-]*) exit 1 ;;
+    esac
+    printf '%s' "$_pop_manual_proof"
+    exit 0
+  fi
+  [ "$1" ] || exit 1
   ${ACME_OPENSSL_BIN:-openssl} pkey -in "$1" -pubout -outform DER -out "$_pop_tmp/key" 2>/dev/null || exit 1
   _pop_alg="$(_pop_key_algorithm "$_pop_tmp/key")" || exit 1
   case "$_pop_alg" in
@@ -5133,7 +5227,20 @@ _pop_retry_wait() {
 }
 
 _pop_check_keys() {
-  Le_PopKey="$(_pop_key_spki "$CERT_KEY_PATH")" || return 1
+  if [ "$_pop_public_key_der_path" ] && [ -s "$_pop_public_key_der_path" ]; then
+    Le_PopKey="$(_pop_der_spki "$_pop_public_key_der_path")" || return 1
+  elif [ "$_pop_public_key" ]; then
+    Le_PopKey="$(_pop_public_key_spki "$_pop_public_key")" || return 1
+  elif [ "$_pop_csr" ]; then
+    Le_PopKey="$(_pop_csr_key_spki "$_pop_csr")" || return 1
+  else
+    Le_PopKey="$(_pop_key_spki "${_pop_proof_key:-$CERT_KEY_PATH}")" || return 1
+  fi
+  if [ "$_pop_proof_key" ] && [ -z "$Le_PopProofCommand" ] &&
+    [ "$Le_PopKey" != "$(_pop_key_spki "$_pop_proof_key")" ]; then
+    _err "The PoP public key does not match the configured private key."
+    return 1
+  fi
   _pop_account_key="$(_pop_key_spki "$ACCOUNT_KEY_PATH")" || return 1
   if [ "$Le_PopKey" = "$_pop_account_key" ]; then
     _err "PoP requires different account and certificate keys."
@@ -5154,6 +5261,10 @@ _pop_send_order() {
 
 # draft §9.2.1: abandon this attempt and use a new, ordinary CSR order.
 _pop_fallback_issue() {
+  if [ "$_pop_csr" ] || [ "$_pop_public_key" ] || [ "$_pop_private_key" ] || [ "$Le_PopProofCommand" ] || [ "$Le_PopManual" = 1 ]; then
+    _err "The configured PoP key/proof source cannot be converted to a CSR fallback."
+    return 1
+  fi
   _pop_kem_required=""
   case "$4" in
   ml-kem-512 | ml-kem-768 | ml-kem-1024) _pop_kem_required=1 ;;
@@ -5183,7 +5294,7 @@ _pop_fallback_issue() {
   Le_Vlist=""
   Le_LinkOrder=""
   Le_OrderFinalize=""
-  for _pop_conf in Le_ACME_Pop Le_Vlist Le_LinkOrder Le_OrderFinalize Le_PopOrder Le_PopKey Le_PopAccountKey; do
+  for _pop_conf in Le_ACME_Pop Le_Vlist Le_LinkOrder Le_OrderFinalize Le_PopOrder Le_PopKey Le_PopAccountKey Le_PopPublicKeyPath Le_PopPrivateKey Le_PopProofCommand Le_PopManual; do
     _cleardomainconf "$_pop_conf"
   done
   issue "$@"
@@ -5254,8 +5365,11 @@ _pop_complete_authorization() {
     _err "Unsupported or malformed PoP challenge."
     return 1
   fi
-  _pop_signature="$(_pop_challenge_proof "$CERT_KEY_PATH" "$_pop_entry" "$DOMAIN_PATH/pop-new-order.json")" || {
-    _err "Unable to generate PoP proof; check the challenge and OpenSSL capabilities."
+  if [ "$DOMAIN_PATH" ]; then
+    printf '%s' "$_pop_entry" >"$DOMAIN_PATH/pop-challenge.json" || return 1
+  fi
+  _pop_signature="$(_pop_challenge_proof "${_pop_proof_key:-$CERT_KEY_PATH}" "$_pop_entry" "$DOMAIN_PATH/pop-new-order.json")" || {
+    _err "Unable to obtain PoP proof; check the configured key, proof command or manual input."
     return 1
   }
   if ! _send_signed_request "$_pop_url" "{\"proof\":\"$_pop_signature\"}" || [ "$code" != 200 ]; then
@@ -5349,6 +5463,62 @@ _send_mtc_signed_request() {
   return "$_mtc_request_result"
 }
 
+_pop_prepare_inputs() {
+  _pop_csr="$_csr"
+  if [ "$Le_ACME_Pop" = 1 ] && [ "$_pop_csr" ] && [ "$_pop_public_key" ]; then
+    _err "Use either --csr or --pop-public-key in PoP mode, not both."
+    return 1
+  fi
+  if [ "$Le_ACME_Pop" = 1 ] && [ -z "$_main_domain" ] && [ -z "$_pop_csr" ] && [ "$Le_PopManual" = 1 ]; then
+    [ "$__INTERACTIVE" ] || return 1
+    printf "Enter domain: " >&2
+    IFS= read -r _main_domain || return 1
+    [ "$_main_domain" ] || return 1
+  fi
+  if [ "$Le_ACME_Pop" = 1 ] && [ "$_pop_csr" ]; then
+    _pop_csr_subject="$(_readSubjectFromCSR "$_pop_csr")" || return 1
+    if _contains "$_pop_csr_subject" ' ' || ! _contains "$_pop_csr_subject" '.'; then
+      _pop_csr_subject=""
+    fi
+    _pop_csr_alt="$(_readSubjectAltNamesFromCSR "$_pop_csr")" || return 1
+    if [ -z "$_pop_csr_subject" ]; then
+      _pop_csr_subject="$(_getfield "$_pop_csr_alt" 1)"
+      _pop_csr_alt="$(echo "$_pop_csr_alt" | cut -d , -f 2-)"
+    fi
+    [ "$_pop_csr_subject" ] || return 1
+    _main_domain="$_pop_csr_subject"
+    _alt_domains="${_pop_csr_alt:-$NO_VALUE}"
+    _pop_input_der="$(mktemp)" || return 1
+    _pop_write_public_key csr "$_pop_input_der" || return 1
+    _key_length="$(_pop_key_length "$_pop_input_der")" || return 1
+  elif [ "$Le_ACME_Pop" = 1 ] && [ "$_pop_public_key" ]; then
+    _pop_input_der="$(mktemp)" || return 1
+    _pop_write_public_key "$_pop_public_key" "$_pop_input_der" || return 1
+    _key_length="$(_pop_key_length "$_pop_input_der")" || return 1
+  elif [ "$Le_ACME_Pop" = 1 ] && [ "$_pop_private_key" ]; then
+    _pop_input_der="$(mktemp)" || return 1
+    _pop_write_public_key private "$_pop_input_der" || return 1
+    _key_length="$(_pop_key_length "$_pop_input_der")" || return 1
+  elif [ "$Le_ACME_Pop" = 1 ] && [ "$Le_PopManual" = 1 ] && [ -z "$_pop_public_key" ]; then
+    [ "$__INTERACTIVE" ] || return 1
+    printf "Enter PoP public key path: " >&2
+    IFS= read -r _pop_public_key || return 1
+    [ "$_pop_public_key" ] || return 1
+    _pop_input_der="$(mktemp)" || return 1
+    _pop_write_public_key "$_pop_public_key" "$_pop_input_der" || return 1
+    _key_length="$(_pop_key_length "$_pop_input_der")" || return 1
+  fi
+  if [ "$Le_ACME_Pop" = 1 ] && [ -z "$_main_domain" ]; then
+    _err "Please specify a domain, or provide --csr in PoP mode."
+    return 1
+  fi
+  if [ "$Le_ACME_Pop" = 1 ] && { [ "$_pop_csr" ] || [ "$_pop_public_key" ]; } &&
+    [ -z "$_pop_private_key" ] && [ -z "$Le_PopProofCommand" ] && [ "$Le_PopManual" != 1 ]; then
+    _err "PoP requires a private key, --pop-proof-command, or --pop-manual."
+    return 1
+  fi
+}
+
 # Fetch the optional landmark certificate without changing issuance success.
 _download_mtc_landmark() {
   _mtc_landmark_url="$(_get_mtc_landmark_link)"
@@ -5413,7 +5583,12 @@ _download_mtc_landmark() {
 #webroot, domain domainlist  keylength
 issue() {
   _pop_before_issue_done=""
-  if [ -z "$2" ]; then
+  _web_roots="$1"
+  _main_domain="$2"
+  _alt_domains="$3"
+  _key_length="$4"
+  _pop_prepare_inputs || return 1
+  if [ -z "$_main_domain" ]; then
     _usage "Usage: $PROJECT_ENTRY --issue --domain <domain.tld> --webroot <directory>"
     return 1
   fi
@@ -5421,10 +5596,6 @@ issue() {
     _usage "Please specify at least one validation method: '--webroot', '--standalone', '--apache', '--nginx' or '--dns' etc."
     return 1
   fi
-  _web_roots="$1"
-  _main_domain="$2"
-  _alt_domains="$3"
-
   if _contains "$_main_domain" ","; then
     _main_domain=$(echo "$2,$3" | cut -d , -f 1)
     _alt_domains=$(echo "$2,$3" | cut -d , -f 2- | sed "s/,${NO_VALUE}$//")
@@ -5432,7 +5603,6 @@ issue() {
   _debug _main_domain "$_main_domain"
   _debug _alt_domains "$_alt_domains"
 
-  _key_length="$4"
   _real_cert="$5"
   _real_key="$6"
   _real_ca="$7"
@@ -5456,6 +5626,24 @@ issue() {
     Le_OrderFinalize=""
     Le_LinkOrder=""
     Le_LinkCert=""
+  fi
+
+  _pop_public_key_der_path=""
+  if [ "$Le_ACME_Pop" = 1 ] && [ "$_pop_input_der" ]; then
+    _pop_public_key_der_path="$DOMAIN_PATH/pop-public-key.der"
+    if ! cp "$_pop_input_der" "$_pop_public_key_der_path"; then
+      _err "Cannot save the PoP public key."
+      return 1
+    fi
+    rm -f "$_pop_input_der"
+  fi
+  if [ "$Le_ACME_Pop" = 1 ] && [ "$_pop_private_key" ]; then
+    _pop_proof_key="$_pop_private_key"
+  elif [ "$Le_ACME_Pop" = 1 ] && [ -z "$_pop_public_key_der_path" ] &&
+    [ -z "$Le_PopProofCommand" ] && [ "$Le_PopManual" != 1 ]; then
+    _pop_proof_key="$CERT_KEY_PATH"
+  else
+    _pop_proof_key=""
   fi
 
   if _hasfield "$_web_roots" "$W_DNS" && [ -z "$FORCE_DNS_MANUAL" ]; then
@@ -5502,7 +5690,7 @@ issue() {
       _err "ML-KEM certificate keys require --acme-pop."
       return 1
     fi
-    if ! _pop_check_kem_support "$_key_length" 2>/dev/null; then
+    if [ -z "$Le_PopProofCommand" ] && [ "$Le_PopManual" != 1 ] && ! _pop_check_kem_support "$_key_length" 2>/dev/null; then
       _err "OpenSSL does not support the required KEM/PoP operations for $_key_length (OpenSSL 3.5+ required)."
       return 1
     fi
@@ -5603,6 +5791,8 @@ issue() {
     fi
   elif [ -f "$CSR_PATH" ] && [ ! -f "$CERT_KEY_PATH" ] && [ "$Le_ACME_Pop" != 1 ]; then
     _info "Signing from existing CSR."
+  elif [ "$Le_ACME_Pop" = 1 ] && { [ "$_pop_csr" ] || [ "$_pop_public_key" ] || [ "$_pop_private_key" ] || [ "$Le_PopManual" = 1 ]; }; then
+    _info "Using the configured PoP public key."
   else
     # When renewing from an old version, the empty Le_Keylength means 2048.
     # Note, do not use DEFAULT_DOMAIN_KEY_LENGTH as that value may change over
@@ -5658,7 +5848,37 @@ issue() {
     fi
   fi
 
+  if [ "$Le_ACME_Pop" = 1 ] && [ -z "$_pop_public_key_der_path" ] && [ -s "$CERT_KEY_PATH" ]; then
+    _pop_public_key_der_path="$DOMAIN_PATH/pop-public-key.der"
+    ${ACME_OPENSSL_BIN:-openssl} pkey -in "$CERT_KEY_PATH" -pubout -outform DER -out "$_pop_public_key_der_path" 2>/dev/null || {
+      _err "Cannot derive the PoP public key."
+      return 1
+    }
+  fi
+
   _savedomainconf "Le_Keylength" "$_key_length"
+  if [ "$Le_ACME_Pop" = 1 ]; then
+    if [ "$_pop_public_key" ] || [ "$_pop_csr" ]; then
+      _savedomainconf "Le_PopPublicKeyPath" "$DOMAIN_PATH/pop-public-key.der"
+    else
+      _cleardomainconf "Le_PopPublicKeyPath"
+    fi
+    if [ "$_pop_private_key" ]; then
+      _savedomainconf "Le_PopPrivateKey" "$_pop_private_key"
+    else
+      _cleardomainconf "Le_PopPrivateKey"
+    fi
+    if [ "$Le_PopProofCommand" ]; then
+      _savedomainconf "Le_PopProofCommand" "$Le_PopProofCommand" "base64"
+    else
+      _cleardomainconf "Le_PopProofCommand"
+    fi
+    if [ "$Le_PopManual" = 1 ]; then
+      _savedomainconf "Le_PopManual" 1
+    else
+      _cleardomainconf "Le_PopManual"
+    fi
+  fi
   if [ "$Le_ACME_Pop" = 1 ] && ! _pop_check_keys; then
     _clearup
     _on_issue_err "$_post_hook"
@@ -6910,6 +7130,10 @@ renew() {
   Le_Valid_To="$(_readdomainconf Le_Valid_To)"
   Le_ExtKeyUse="$(_readdomainconf Le_ExtKeyUse)"
   Le_ACME_Pop="$(_readdomainconf Le_ACME_Pop)"
+  _pop_public_key="$(_readdomainconf Le_PopPublicKeyPath)"
+  _pop_private_key="$(_readdomainconf Le_PopPrivateKey)"
+  Le_PopProofCommand="$(_readdomainconf Le_PopProofCommand)"
+  Le_PopManual="$(_readdomainconf Le_PopManual)"
 
   # When renewing from an old version, the empty Le_Keylength means 2048.
   # Note, do not use DEFAULT_DOMAIN_KEY_LENGTH as that value may change over
@@ -7090,10 +7314,6 @@ ${_skipped_msg}
 
 #csr webroot
 signcsr() {
-  if [ "$Le_ACME_Pop" = 1 ]; then
-    _err "--signcsr cannot be combined with --acme-pop; use --issue."
-    return 1
-  fi
   _csrfile="$1"
   _csrW="$2"
   if [ -z "$_csrfile" ] || [ -z "$_csrW" ]; then
@@ -7116,6 +7336,12 @@ signcsr() {
   _valid_t="${15}"
   _cert_prof="${16}"
   _en_key_usage="${17}"
+
+  if [ "$Le_ACME_Pop" = 1 ]; then
+    _csr="$_csrfile"
+    issue "$_csrW" "" "$NO_VALUE" "$DEFAULT_DOMAIN_KEY_LENGTH" "$_real_cert" "$_real_key" "$_real_ca" "$_reload_cmd" "$_real_fullchain" "$_pre_hook" "$_post_hook" "$_renew_hook" "$_local_addr" "$_challenge_alias" "$_preferred_chain" "$_valid_f" "$_valid_t" "$_cert_prof" "$_en_key_usage"
+    return $?
+  fi
 
   _csrsubj=$(_readSubjectFromCSR "$_csrfile")
   if [ "$?" != "0" ]; then
@@ -8625,7 +8851,7 @@ Commands:
   --info                   Show the $PROJECT_NAME configs, or the configs for a domain with [-d domain] parameter.
   --to-pkcs12              Export the certificate and key to a pfx file.
   --to-pkcs8               Convert to pkcs8 format.
-  --sign-csr               Issue a cert from an existing csr.
+  --sign-csr               Issue from an existing CSR; with --acme-pop it uses the CSR only as key/domain input.
   --show-csr               Show the content of a csr.
   -ccr, --create-csr       Create CSR, professional use.
   --create-domain-key      Create an domain private key, professional use.
@@ -8663,6 +8889,11 @@ Parameters:
                                    Also permits --keylength ed25519, ml-dsa-44/65/87 or
                                    ml-kem-512/768/1024 (ML-DSA/ML-KEM: OpenSSL 3.5+).
                                    ML-KEM requires PoP and cannot fall back to a CSR.
+  --pop-public-key <file>           Use a PEM or DER public key as the PoP key (mutually exclusive with --csr).
+  --pop-private-key <file>          Use a local private key for PoP proof.
+  --pop-proof-command <command>     Get the proof from an external key device. It receives
+                                   ACME_POP_CHALLENGE_FILE, ACME_POP_ORDER_FILE and ACME_POP_PUBLIC_KEY_FILE.
+  --pop-manual                      Prompt for the PoP public key and proof interactively.
   --mtc-landmark                    Request MTC certificate responses and optionally download the
                                       landmark certificate as <domain>-landmark.cer. A pending or
                                       unavailable landmark does not fail standalone certificate issuance.
@@ -8755,7 +8986,7 @@ Parameters:
   --force-color                     Force output of color text. Useful for non-interactive use with the aha tool for HTML E-Mails.
   --ecc                             Specifies use of the ECC cert. Only valid for '--install-cert', '--renew', '--remove ', '--revoke',
                                       '--deploy', '--to-pkcs8', '--to-pkcs12' and '--create-csr'.
-  --csr <file>                      Specifies the input csr.
+  --csr <file>                      Specifies the input CSR; with --acme-pop it only supplies domains and public key.
   --pre-hook <command>              Command to be run before obtaining any certificates.
   --post-hook <command>             Command to be run after attempting to obtain/renew certificates. Runs regardless of whether obtain/renew succeeded or failed.
   --renew-hook <command>            Command to be run after each successfully renewed certificate.
@@ -9101,6 +9332,10 @@ _process() {
   _valid_to=""
   _certificate_profile=""
   _extended_key_usage=""
+  _pop_public_key=""
+  _pop_private_key=""
+  Le_PopProofCommand=""
+  Le_PopManual=""
   _dns_persist_wildcard=""
   _dns_persist_ca_name=""
   _dns_persist_days=""
@@ -9671,6 +9906,33 @@ _process() {
       ;;
     --acme-pop)
       Le_ACME_Pop="1"
+      ;;
+    --pop-public-key)
+      if [ -z "$2" ] || _startswith "$2" "-"; then
+        _usage "Please specify a public key file for '--pop-public-key'"
+        return 1
+      fi
+      _pop_public_key="$2"
+      shift
+      ;;
+    --pop-private-key)
+      if [ -z "$2" ] || _startswith "$2" "-"; then
+        _usage "Please specify a private key file for '--pop-private-key'"
+        return 1
+      fi
+      _pop_private_key="$2"
+      shift
+      ;;
+    --pop-proof-command)
+      if [ -z "$2" ] || _startswith "$2" "-"; then
+        _usage "Please specify a proof command for '--pop-proof-command'"
+        return 1
+      fi
+      Le_PopProofCommand="$2"
+      shift
+      ;;
+    --pop-manual)
+      Le_PopManual="1"
       ;;
     --mtc-landmark)
       Le_MTC_Landmark="1"
