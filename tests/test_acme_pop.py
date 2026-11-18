@@ -95,13 +95,52 @@ class PopTests(unittest.TestCase):
         domain = self.work / "domain"
         domain.mkdir()
         challenge = '{"type":"pop-01","popNonce":"nonce"}'
-        command = 'test -s "$ACME_POP_CHALLENGE_FILE" && test -s "$ACME_POP_ORDER_FILE" && printf external-proof'
+        command = domain / "proof-command"
+        command.write_text(
+            '#!/bin/sh\n'
+            '[ -s "$ACME_POP_CHALLENGE_FILE" ] || exit 1\n'
+            '[ -s "$ACME_POP_ORDER_FILE" ] || exit 1\n'
+            'printf external-proof\n'
+        )
+        command.chmod(0o700)
         result = self.shell(
             'DOMAIN_PATH="$1"; Le_PopProofCommand="$2"; _pop_challenge_proof "" "$3" "$4"',
             domain, command, challenge, self.order,
         )
         self.assertEqual(result.stdout.strip(), "external-proof")
         self.assertEqual((domain / "pop-challenge.json").read_text(), challenge)
+
+    def test_provider_requires_key_ref(self):
+        result = self.shell(
+            'Le_ACME_Pop=1; _pop_provider=pop_test; _main_domain=example.com; _pop_prepare_inputs',
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires --pop-key-ref", result.stderr)
+
+        result = self.shell(
+            'Le_ACME_Pop=1; _pop_key_ref=orphan; _main_domain=example.com; _pop_prepare_inputs',
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires --pop-provider", result.stderr)
+
+    def test_csr_input_requires_a_proof_source(self):
+        key = self.work / "key.pem"
+        csr = self.work / "request.csr"
+        self.openssl("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", key)
+        self.openssl("req", "-new", "-key", key, "-subj", "/CN=example.com", "-addext", "subjectAltName=DNS:example.com", "-out", csr)
+        result = self.shell(
+            '_csr="$1"; Le_ACME_Pop=1; _pop_prepare_inputs', csr, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires a private key", result.stderr)
+
+        result = self.shell(
+            '_csr="$1"; _pop_private_key="$2"; Le_ACME_Pop=1; _pop_prepare_inputs; printf "%s" "$_key_length"',
+            csr, key,
+        )
+        self.assertEqual(result.stdout.strip(), "ec-256")
 
     def test_pop_provider_receives_base64url_operations(self):
         key, ciphertext, _ = self.kem_fixture("ML-KEM-768")

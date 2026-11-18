@@ -491,10 +491,11 @@ Without either option, acme.sh keeps its normal local key generation. A
 private key may be supplied as `--pop-private-key <file>`.
 
 For a key that cannot be used through the local OpenSSL provider, configure
-`--pop-proof-command <command>`. The command must print the base64url proof
+`--pop-proof-command <executable>`. The executable must print the base64url proof
 and can read the challenge, exact new-order payload, and public key from the
 `ACME_POP_CHALLENGE_FILE`, `ACME_POP_ORDER_FILE`, and
-`ACME_POP_PUBLIC_KEY_FILE` environment variables. `--pop-manual` prompts for
+`ACME_POP_PUBLIC_KEY_FILE` environment variables. It must be an executable
+path or command name; arguments are not parsed from this option. `--pop-manual` prompts for
 the public key path and, after the order is created, the externally generated
 proof. The challenge is also saved as `pop-challenge.json` for token/HSM
 workflows.
@@ -511,8 +512,10 @@ executables configured with `POP_CommandPublicKey`, `POP_CommandSign`, and
 Examples:
 
 ```sh
-# CSR migration: domains and public key come from the CSR; no CSR is finalized.
-acme.sh --issue --acme-pop --csr request.csr --dns dns_ali
+# CSR migration: domains and public key come from the CSR; the matching private
+# key (or a provider/manual proof source) is still needed for PoP proof.
+acme.sh --issue --acme-pop --csr request.csr \
+  --pop-private-key request.key --dns dns_ali
 
 # Public-key input with a local private key used only for proof.
 acme.sh --issue --acme-pop --pop-public-key device-public.pem \

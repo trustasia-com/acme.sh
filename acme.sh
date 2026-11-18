@@ -5238,7 +5238,7 @@ _pop_challenge_proof() (
     ACME_POP_PUBLIC_KEY_FILE="$DOMAIN_PATH/pop-public-key.der"
     export ACME_POP_CHALLENGE_FILE ACME_POP_ORDER_FILE ACME_POP_PUBLIC_KEY_FILE
     _pop_external_output="$_pop_tmp/proof"
-    if ! eval "$Le_PopProofCommand" >"$_pop_external_output"; then exit 1; fi
+    if ! "$Le_PopProofCommand" >"$_pop_external_output"; then exit 1; fi
     _pop_external_proof="$(tr -d '\r\n' <"$_pop_external_output")"
     case "$_pop_external_proof" in
     '' | *[!A-Za-z0-9_-]*) exit 1 ;;
@@ -5634,6 +5634,24 @@ _pop_prepare_inputs() {
     _err "Use either --csr or --pop-public-key in PoP mode, not both."
     return 1
   fi
+  if [ "$Le_ACME_Pop" != 1 ] && { [ "$_pop_provider" ] || [ "$_pop_key_ref" ]; }; then
+    _err "--pop-provider and --pop-key-ref require --acme-pop."
+    return 1
+  fi
+  if [ "$Le_ACME_Pop" = 1 ] && [ "$_pop_provider" ] && [ -z "$_pop_key_ref" ]; then
+    _err "--pop-provider requires --pop-key-ref."
+    return 1
+  fi
+  if [ "$Le_ACME_Pop" = 1 ] && [ -z "$_pop_provider" ] && [ "$_pop_key_ref" ]; then
+    _err "--pop-key-ref requires --pop-provider."
+    return 1
+  fi
+  if [ "$Le_ACME_Pop" = 1 ] && [ "$Le_PopProofCommand" ]; then
+    if [ ! -x "$Le_PopProofCommand" ] && ! command -v "$Le_PopProofCommand" >/dev/null 2>&1; then
+      _err "PoP proof executable was not found: $Le_PopProofCommand"
+      return 1
+    fi
+  fi
   if [ "$Le_ACME_Pop" = 1 ] && [ -z "$_main_domain" ] && [ -z "$_pop_csr" ] && [ "$Le_PopManual" = 1 ]; then
     [ "$__INTERACTIVE" ] || return 1
     printf "Enter domain: " >&2
@@ -5662,7 +5680,7 @@ _pop_prepare_inputs() {
     elif [ "$_pop_public_key" ]; then
       _pop_declared_key_spki="$(_pop_public_key_spki "$_pop_public_key")" || return 1
     fi
-    _pop_input_der="$(mktemp)" || return 1
+    _pop_input_der="$(_mktemp)" || return 1
     _pop_provider_get_public_key_der >"$_pop_input_der" || return 1
     _key_length="$(_pop_key_length "$_pop_input_der")" || return 1
   elif [ "$Le_ACME_Pop" = 1 ] && [ "$_pop_csr" ]; then
@@ -5678,15 +5696,15 @@ _pop_prepare_inputs() {
     [ "$_pop_csr_subject" ] || return 1
     _main_domain="$_pop_csr_subject"
     _alt_domains="${_pop_csr_alt:-$NO_VALUE}"
-    _pop_input_der="$(mktemp)" || return 1
+    _pop_input_der="$(_mktemp)" || return 1
     _pop_write_public_key csr "$_pop_input_der" || return 1
     _key_length="$(_pop_key_length "$_pop_input_der")" || return 1
   elif [ "$Le_ACME_Pop" = 1 ] && [ "$_pop_public_key" ]; then
-    _pop_input_der="$(mktemp)" || return 1
+    _pop_input_der="$(_mktemp)" || return 1
     _pop_write_public_key "$_pop_public_key" "$_pop_input_der" || return 1
     _key_length="$(_pop_key_length "$_pop_input_der")" || return 1
   elif [ "$Le_ACME_Pop" = 1 ] && [ "$_pop_private_key" ]; then
-    _pop_input_der="$(mktemp)" || return 1
+    _pop_input_der="$(_mktemp)" || return 1
     _pop_write_public_key private "$_pop_input_der" || return 1
     _key_length="$(_pop_key_length "$_pop_input_der")" || return 1
   elif [ "$Le_ACME_Pop" = 1 ] && [ "$Le_PopManual" = 1 ] && [ -z "$_pop_public_key" ]; then
@@ -5694,7 +5712,7 @@ _pop_prepare_inputs() {
     printf "Enter PoP public key path: " >&2
     IFS= read -r _pop_public_key || return 1
     [ "$_pop_public_key" ] || return 1
-    _pop_input_der="$(mktemp)" || return 1
+    _pop_input_der="$(_mktemp)" || return 1
     _pop_write_public_key "$_pop_public_key" "$_pop_input_der" || return 1
     _key_length="$(_pop_key_length "$_pop_input_der")" || return 1
   fi
@@ -9097,7 +9115,7 @@ Parameters:
   --pop-private-key <file>          Use a local private key for PoP proof.
   --pop-provider <name>             Use a provider from popapi/<name> for PoP key operations.
   --pop-key-ref <ref>               Pass the provider key reference to its operations.
-  --pop-proof-command <command>     Get the proof from an external key device. It receives
+  --pop-proof-command <executable>  Get the proof from an external key device executable. It receives
                                    ACME_POP_CHALLENGE_FILE, ACME_POP_ORDER_FILE and ACME_POP_PUBLIC_KEY_FILE.
   --pop-manual                      Prompt for the PoP public key and proof interactively.
   --mtc-landmark                    Request MTC certificate responses and optionally download the
