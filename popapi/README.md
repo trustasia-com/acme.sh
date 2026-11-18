@@ -8,9 +8,9 @@ The provider functions are called with base64url values so binary key
 operations do not pass through shell arguments as raw bytes:
 
 ```sh
-<name>_get_public_key <key-id>
-<name>_sign <key-id> <algorithm> <message-base64url>
-<name>_decap <key-id> <algorithm> <ciphertext-base64url>
+<name>_get_public_key <key-ref>
+<name>_sign <key-ref> <algorithm> <message-base64url>
+<name>_decap <key-ref> <algorithm> <ciphertext-base64url>
 ```
 
 `get_public_key` returns canonical DER SubjectPublicKeyInfo encoded as
@@ -22,12 +22,12 @@ Example:
 
 ```sh
 ./acme.sh --issue --acme-pop \
-  --pop-provider pop_command --pop-key-id device-42 \
+  --pop-provider pop_command --pop-key-ref device-42 \
   --dns dns_ali -d example.com
 ```
 
 The bundled `pop_command` provider calls executables configured through
 `POP_CommandPublicKey`, `POP_CommandSign`, and `POP_CommandDecap`. The sign
-executable receives `POP_KEY_ID`, `POP_ALGORITHM`, and `POP_MESSAGE`; the
-decapsulation executable receives `POP_KEY_ID`, `POP_ALGORITHM`, and
+executable receives `POP_KEY_REF`, `POP_ALGORITHM`, and `POP_MESSAGE`; the
+decapsulation executable receives `POP_KEY_REF`, `POP_ALGORITHM`, and
 `POP_CIPHERTEXT`.

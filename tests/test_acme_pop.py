@@ -132,13 +132,13 @@ pop_test_decap() {
         script = r'''
 TEST_KEY="$1"; TEST_TMP="$2"; TEST_PROVIDER="$3"; TEST_PUBLIC="$4"
 export TEST_KEY TEST_TMP
-DOMAIN_PATH="$2"; _pop_provider=pop_test; _pop_key_id=test-key
+DOMAIN_PATH="$2"; _pop_provider=pop_test; _pop_key_ref=test-key
 _pop_public_key_der_path="$TEST_PUBLIC"
 _findHook() { printf '%s' "$TEST_PROVIDER"; }
 _pop_provider_proof pop_test "$5" "$6"
 '''
         public_check = self.shell(
-            'TEST_KEY="$1"; TEST_PROVIDER="$2"; _pop_provider=pop_test; _pop_key_id=test-key; '
+            'TEST_KEY="$1"; TEST_PROVIDER="$2"; _pop_provider=pop_test; _pop_key_ref=test-key; '
             '_findHook() { printf "%s" "$TEST_PROVIDER"; }; '
             '_pop_provider_get_public_key_der >"$3" && _pop_key_length "$3"',
             sig_key, provider, self.work / "provider-public.der",

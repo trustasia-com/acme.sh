@@ -500,7 +500,7 @@ proof. The challenge is also saved as `pop-challenge.json` for token/HSM
 workflows.
 
 For a reusable key-operation integration, use a provider under `popapi/`:
-`--pop-provider <name> --pop-key-id <id>`. The provider returns the public key,
+`--pop-provider <name> --pop-key-ref <ref>`. The provider returns the public key,
 accepts a base64url message and returns a base64url signature, or accepts a
 base64url KEM ciphertext and returns the base64url 32-byte decapsulation
 secret. acme.sh performs the draft-01 proof binding and HKDF/HMAC calculation.
@@ -525,7 +525,7 @@ acme.sh --issue --acme-pop --pop-public-key device-public.pem \
 # Provider API: acme.sh passes the exact signing message or KEM ciphertext
 # to popapi/pop_command.sh's configured operation executable.
 acme.sh --issue --acme-pop --pop-provider pop_command \
-  --pop-key-id device-42 --dns dns_ali -d example.com
+  --pop-key-ref device-42 --dns dns_ali -d example.com
 
 # Fully manual input and proof.
 acme.sh --issue --acme-pop --pop-manual --dns \

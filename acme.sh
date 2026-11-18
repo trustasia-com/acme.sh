@@ -4992,9 +4992,9 @@ _pop_key_length() (
 )
 
 # Load a PoP key provider from popapi/<provider>.sh. Providers must expose:
-#   <provider>_get_public_key key_id -> base64url DER SPKI
-#   <provider>_sign key_id algorithm message_base64url -> base64url signature
-#   <provider>_decap key_id algorithm ciphertext_base64url -> base64url secret
+#   <provider>_get_public_key key_ref -> base64url DER SPKI
+#   <provider>_sign key_ref algorithm message_base64url -> base64url signature
+#   <provider>_decap key_ref algorithm ciphertext_base64url -> base64url secret
 _pop_provider_load() {
   if [ -z "$_pop_provider" ]; then
     return 1
@@ -5029,7 +5029,7 @@ _pop_provider_get_public_key_der() (
     _err "PoP provider $_pop_provider does not implement $_pop_provider_get_public_key" >&2
     exit 1
   fi
-  _pop_provider_public="$($_pop_provider_get_public_key "$_pop_key_id")" || exit 1
+  _pop_provider_public="$($_pop_provider_get_public_key "$_pop_key_ref")" || exit 1
   _pop_provider_public="$(_pop_validate_b64url "$_pop_provider_public")" || exit 1
   _durl_replace_base64 "$_pop_provider_public" | _dbase64
 )
@@ -5040,7 +5040,7 @@ _pop_provider_sign() {
     _err "PoP provider $_pop_provider does not implement $_pop_provider_sign_function"
     return 1
   fi
-  "$_pop_provider_sign_function" "$_pop_key_id" "$1" "$2"
+  "$_pop_provider_sign_function" "$_pop_key_ref" "$1" "$2"
 }
 
 _pop_provider_decap() {
@@ -5049,7 +5049,7 @@ _pop_provider_decap() {
     _err "PoP provider $_pop_provider does not implement $_pop_provider_decap_function"
     return 1
   fi
-  "$_pop_provider_decap_function" "$_pop_key_id" "$1" "$2"
+  "$_pop_provider_decap_function" "$_pop_key_ref" "$1" "$2"
 }
 
 _pop_validate_b64url() (
@@ -5457,7 +5457,7 @@ _pop_fallback_issue() {
   Le_Vlist=""
   Le_LinkOrder=""
   Le_OrderFinalize=""
-  for _pop_conf in Le_ACME_Pop Le_Vlist Le_LinkOrder Le_OrderFinalize Le_PopOrder Le_PopKey Le_PopAccountKey Le_PopPublicKeyPath Le_PopPrivateKey Le_PopProvider Le_PopKeyId Le_PopProofCommand Le_PopManual; do
+  for _pop_conf in Le_ACME_Pop Le_Vlist Le_LinkOrder Le_OrderFinalize Le_PopOrder Le_PopKey Le_PopAccountKey Le_PopPublicKeyPath Le_PopPrivateKey Le_PopProvider Le_PopKeyRef Le_PopProofCommand Le_PopManual; do
     _cleardomainconf "$_pop_conf"
   done
   issue "$@"
@@ -6061,14 +6061,14 @@ issue() {
     fi
     if [ "$_pop_provider" ]; then
       _savedomainconf "Le_PopProvider" "$_pop_provider"
-      if [ "$_pop_key_id" ]; then
-        _savedomainconf "Le_PopKeyId" "$_pop_key_id" "base64"
+      if [ "$_pop_key_ref" ]; then
+        _savedomainconf "Le_PopKeyRef" "$_pop_key_ref" "base64"
       else
-        _cleardomainconf "Le_PopKeyId"
+        _cleardomainconf "Le_PopKeyRef"
       fi
     else
       _cleardomainconf "Le_PopProvider"
-      _cleardomainconf "Le_PopKeyId"
+      _cleardomainconf "Le_PopKeyRef"
     fi
     if [ "$Le_PopProofCommand" ]; then
       _savedomainconf "Le_PopProofCommand" "$Le_PopProofCommand" "base64"
@@ -7335,7 +7335,7 @@ renew() {
   _pop_public_key="$(_readdomainconf Le_PopPublicKeyPath)"
   _pop_private_key="$(_readdomainconf Le_PopPrivateKey)"
   _pop_provider="$(_readdomainconf Le_PopProvider)"
-  _pop_key_id="$(_readdomainconf Le_PopKeyId)"
+  _pop_key_ref="$(_readdomainconf Le_PopKeyRef)"
   Le_PopProofCommand="$(_readdomainconf Le_PopProofCommand)"
   Le_PopManual="$(_readdomainconf Le_PopManual)"
 
@@ -9096,7 +9096,7 @@ Parameters:
   --pop-public-key <file>           Use a PEM or DER public key as the PoP key (mutually exclusive with --csr).
   --pop-private-key <file>          Use a local private key for PoP proof.
   --pop-provider <name>             Use a provider from popapi/<name> for PoP key operations.
-  --pop-key-id <id>                 Pass the provider key identifier to its operations.
+  --pop-key-ref <ref>               Pass the provider key reference to its operations.
   --pop-proof-command <command>     Get the proof from an external key device. It receives
                                    ACME_POP_CHALLENGE_FILE, ACME_POP_ORDER_FILE and ACME_POP_PUBLIC_KEY_FILE.
   --pop-manual                      Prompt for the PoP public key and proof interactively.
@@ -9541,7 +9541,7 @@ _process() {
   _pop_public_key=""
   _pop_private_key=""
   _pop_provider=""
-  _pop_key_id=""
+  _pop_key_ref=""
   Le_PopProofCommand=""
   Le_PopManual=""
   _dns_persist_wildcard=""
@@ -10139,12 +10139,12 @@ _process() {
       _pop_provider="$2"
       shift
       ;;
-    --pop-key-id)
+    --pop-key-ref)
       if [ -z "$2" ] || _startswith "$2" "-"; then
-        _usage "Please specify a provider key identifier for '--pop-key-id'"
+        _usage "Please specify a provider key reference for '--pop-key-ref'"
         return 1
       fi
-      _pop_key_id="$2"
+      _pop_key_ref="$2"
       shift
       ;;
     --pop-proof-command)
