@@ -479,10 +479,65 @@ setting is saved for subsequent renewals.
 
 ### Experimental CSR-less PoP and ML-KEM Certificates
 
-`--acme-pop` enables [draft-ietf-acme-pop-00](https://datatracker.ietf.org/doc/html/draft-ietf-acme-pop-00).
+`--acme-pop` enables [draft-ietf-acme-pop-01](https://datatracker.ietf.org/doc/html/draft-ietf-acme-pop-01).
 The certificate public key is committed when creating the order. A separate
 `pop-01` authorization proves possession of its private key, and the order is
 finalized without a CSR. Domain validation still runs normally.
+
+PoP accepts three key input styles. With `--csr <file>`, acme.sh reads the
+domains and public key from the CSR, but still finalizes with `{}`. With
+`--pop-public-key <file>`, it reads a PEM or DER SubjectPublicKeyInfo directly.
+Without either option, acme.sh keeps its normal local key generation. A
+private key may be supplied as `--pop-private-key <file>`.
+
+For a key that cannot be used through the local OpenSSL provider, configure
+`--pop-proof-command <executable>`. The executable must print the base64url proof
+and can read the challenge, exact new-order payload, and public key from the
+`ACME_POP_CHALLENGE_FILE`, `ACME_POP_ORDER_FILE`, and
+`ACME_POP_PUBLIC_KEY_FILE` environment variables. It must be an executable
+path or command name; arguments are not parsed from this option. `--pop-manual` prompts for
+the public key path and, after the order is created, the externally generated
+proof. The challenge is also saved as `pop-challenge.json` for token/HSM
+workflows.
+
+For a reusable key-operation integration, use a provider under `popapi/`:
+`--pop-provider <name> --pop-key-ref <ref>`. The provider returns the public key,
+accepts a base64url message and returns a base64url signature, or accepts a
+base64url KEM ciphertext and returns the base64url 32-byte decapsulation
+secret. acme.sh performs the draft-01 proof binding and HKDF/HMAC calculation.
+The bundled `pop_command` provider connects these operations to three local
+executables configured with `POP_CommandPublicKey`, `POP_CommandSign`, and
+`POP_CommandDecap`.
+
+Examples:
+
+```sh
+# CSR migration: domains and public key come from the CSR; the matching private
+# key (or a provider/manual proof source) is still needed for PoP proof.
+acme.sh --issue --acme-pop --csr request.csr \
+  --pop-private-key request.key --dns dns_ali
+
+# Public-key input with a local private key used only for proof.
+acme.sh --issue --acme-pop --pop-public-key device-public.pem \
+  --pop-private-key device-private.pem --dns dns_ali -d example.com
+
+# Public-key input with an external token/HSM adapter.
+acme.sh --issue --acme-pop --pop-public-key device-public.pem \
+  --pop-proof-command '/usr/local/bin/pop-proof' --dns dns_ali -d example.com
+
+# Provider API: acme.sh passes the exact signing message or KEM ciphertext
+# to popapi/pop_command.sh's configured operation executable.
+acme.sh --issue --acme-pop --pop-provider pop_command \
+  --pop-key-ref device-42 --dns dns_ali -d example.com
+
+# Fully manual input and proof.
+acme.sh --issue --acme-pop --pop-manual --dns \
+  --yes-I-know-dns-manual-mode-enough-go-ahead-please
+```
+
+The challenge type remains `pop-01`. ML-DSA proofs use an empty context string
+as required by draft-01. STAR orders are not implemented; ordinary client-driven
+renewal is unaffected by the new `popStarSupported` discovery field.
 
 For an ACME server supporting ML-KEM, use OpenSSL 3.5 or newer with ML-KEM enabled:
 
