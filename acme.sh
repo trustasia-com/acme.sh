@@ -5216,6 +5216,8 @@ _download_mtc_landmark() {
       fi
       _info "The optional MTC landmark certificate is pending. Retrying in $_mtc_retry_after seconds."
       _sleep "$_mtc_retry_after"
+      # The nonce from the pending response may have expired while waiting.
+      _CACHED_NONCE=""
       _mtc_wait_left="$(_math "$_mtc_wait_left - $_mtc_retry_after")"
       continue
     fi

@@ -64,6 +64,7 @@
 - 📜 Full ACME protocol implementation
 - 🔑 Support **ECDSA** certificates
 - 🌐 Support **SAN** and **wildcard** certificates
+- 🌳 Experimental support for [Merkle Tree Certificates (MTC)](#experimental-mtc-certificates)
 - ⚡ Simple, powerful and very easy to use — only **3 minutes** to learn!
 - 🔧 Compatible with **Bash**, **dash** and **sh**
 - 🚫 No dependencies on Python
@@ -496,19 +497,80 @@ acme.sh --issue -d example.com --dns-persist
 
 ### Experimental MTC Certificates
 
-For an ACME server that supports Merkle Tree Certificates, add `--mtc-landmark`
-to an issue command:
+Use the script from this branch with a CA that issues Merkle Tree Certificates
+(MTC) over ACME. Set `--server` to the CA's ACME directory URL and use a domain
+validation method the CA supports. To use the HTTP-01 example, replace the
+domain and webroot with those of your site.
+
+请使用本分支的脚本和支持通过 ACME 签发 MTC（默克尔树证书）的 CA。将示例中的
+`--server` 参数值替换为 CA 的 ACME Directory URL，并选择 CA 支持的域名验证方式。
+使用 HTTP-01 示例时，请填入你的网站域名和网站根目录。
 
 ```sh
-acme.sh --issue --mtc-landmark -d example.com --server <mtc-ca> --standalone
+./acme.sh --issue --mtc-landmark --server https://mtc-ca.example/acme/directory \
+  -d example.com --keylength ec-256 --webroot /var/www/example.com
 ```
 
-acme.sh requests the MTC certificate representation and keeps the regular
-certificate, CA, and full-chain output paths. If the CA offers an
-`acme-optional-alternate` Link, acme.sh also writes the landmark certificate to
-`<domain>-landmark.cer`. A pending landmark is retried for at most five hours;
-if it remains unavailable, standalone certificate issuance still succeeds. The
-setting is saved for subsequent renewals.
+If the CA requires a specific MTC profile, add `--cert-profile` with the profile
+name it provides. 如果 CA 要求指定 MTC 签发配置，请通过 `--cert-profile` 传入 CA 提供的名称。
+
+#### DNS-01 with Alibaba Cloud DNS / 使用阿里云 DNS 验证
+
+This example uses TrustAsia's MTC staging CA and its seven-day `mtc-7d-07`
+profile. Replace `example.com` with a domain managed by your configured
+`dns_ali` account. acme.sh creates and removes the challenge TXT record.
+此示例使用 TrustAsia MTC Staging CA 的七天 `mtc-7d-07` 配置档案。请将
+`example.com` 替换成已配置的 `dns_ali` 账号管理的域名，脚本会创建并清理验证 TXT 记录。
+[TrustAsia MTC profile details / 配置档案详情](https://acme.mtc-staging.trustasia.com/acme/v2/profiles#mtc-7d-07)
+
+```sh
+./acme.sh --issue --mtc-landmark \
+  --server https://acme.mtc-staging.trustasia.com/acme/v2/directory \
+  --cert-profile mtc-7d-07 --extended-key-usage serverAuth \
+  -d example.com --keylength ec-256 --dns dns_ali
+```
+
+#### Output, renewal, and deployment / 输出、续期和部署
+
+With the default configuration, both ECC examples store their files under
+`~/.acme.sh/example.com_ecc/`. 默认配置下，以上两个 ECC 示例的文件都保存在此目录。
+
+| File / 文件 | Contents / 内容 |
+| --- | --- |
+| `example.com.cer` | Standalone MTC certificate / 独立版 MTC 证书 |
+| `example.com.key` | Matching private key / 配套私钥 |
+| `example.com-landmark.cer` | Optional landmark-relative certificate from the same order / 同一订单的可选地标相对证书 |
+
+If the primary response includes additional certificates, acme.sh also writes
+`fullchain.cer` and `ca.cer`. When the optional landmark URL returns HTTP 202,
+acme.sh retries with up to five hours of cumulative wait time between polls.
+Issuance can complete with the standalone certificate alone.
+如果 CA 的主证书响应包含额外证书，脚本还会保存 `fullchain.cer` 和 `ca.cer`。
+可选地标证书的下载链接返回 HTTP 202 时，脚本会重试，重试间隔累计最多五小时。
+只有独立版证书时，签发也可成功完成。
+
+To confirm the landmark was downloaded for the current run, look for
+`The optional MTC landmark certificate is in` in the output and check the
+reported `*-landmark.cer` file. 请以本次运行输出中的该提示和文件路径确认地标相对证书已下载。
+
+acme.sh saves `--mtc-landmark` for scheduled and manual renewals. Run scheduled
+renewals with an installed acme.sh version that supports MTC. 定时续期和手动续期
+都会沿用已保存的 `--mtc-landmark` 设置。定时任务需使用支持 MTC 的 acme.sh 版本。
+
+```sh
+./acme.sh --renew -d example.com --ecc
+```
+
+For TLS deployment, use the standalone certificate and its private key with an
+MTC-capable TLS server and clients that trust the issuing MTC CA. Use
+`--install-cert --ecc` with `--cert-file` and `--key-file` to copy the standalone
+certificate and key to your deployment paths. Configure the optional
+landmark-relative certificate alongside the standalone certificate and serve it
+only to clients that recognize the corresponding landmark.
+部署时，请使用支持 MTC 的 TLS 服务端和支持 MTC 且信任该 CA 的客户端。可通过
+`--install-cert --ecc` 的 `--cert-file` 和 `--key-file` 参数，将独立版证书和配套私钥复制到
+部署路径。地标相对证书可与独立版证书一同配置，仅向已识别对应地标的客户端提供。
+[IETF MTC draft, Use in TLS / TLS 部署说明](https://datatracker.ietf.org/doc/html/draft-ietf-plants-merkle-tree-certs#section-8)
 
 ---
 
